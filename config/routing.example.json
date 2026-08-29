@@ -1,0 +1,18 @@
+{
+  "performance_test": {
+    "description": "性能测试进度、测试结果和测试环境问题",
+    "keywords": ["性能测试", "benchmark", "吞吐", "时延", "测试结果"],
+    "contacts": [
+      {"employee_number": "00123456", "priority": 1}
+    ],
+    "required_information": ["当前状态", "已完成内容", "阻塞问题", "预计完成时间"]
+  },
+  "cross_domain_network": {
+    "description": "跨域网络、带宽、丢包和DPU部署问题",
+    "keywords": ["跨域", "带宽", "丢包", "网络时延", "DPU"],
+    "contacts": [
+      {"employee_number": "00678901", "priority": 1}
+    ],
+    "required_information": ["当前方案", "已完成验证", "存在问题", "下一步计划"]
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "users": {
+    "00123456": {
+      "enabled": true,
+      "topics": ["project_status", "document_location", "meeting_information"]
+    }
+  },
+  "groups": {
+    "1234567891011": {
+      "enabled": true,
+      "only_when_mentioned": true
+    }
+  }
+}

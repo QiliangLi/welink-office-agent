@@ -1,0 +1,27 @@
+{
+  "dry_run": true,
+  "agent_footer_text": "—— 此条消息来自 WeLink CLI Agent",
+  "agent_marker": "[WELINK_AGENT_MESSAGE]",
+  "max_active_waiting_tasks_per_contact": 1,
+  "follow_up": {
+    "first_reminder_after_hours": 4,
+    "reminder_interval_hours": 4,
+    "max_reminders": 2
+  },
+  "dynamic_items": {
+    "auto_execute_when": [
+      "只需要联系一个已配置同事",
+      "预计一轮简单询问即可完成",
+      "只是查询、确认或获取现有信息",
+      "不涉及资源申请、承诺或新交付物",
+      "明确服务于当前主任务"
+    ],
+    "require_owner_when": [
+      "需要协调多人或多个团队",
+      "需要反复沟通",
+      "需要制作新的报告、方案或材料",
+      "涉及额外资源、时间承诺、范围变更或责任分配",
+      "明显扩展原任务范围"
+    ]
+  }
+}

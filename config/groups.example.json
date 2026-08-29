@@ -1,0 +1,16 @@
+{
+  "REPLACE_WITH_CONTROL_GROUP_ID": {
+    "name": "Agent控制群",
+    "trusted": true,
+    "type": "owner_control",
+    "auto_reply": true,
+    "only_when_mentioned": false
+  },
+  "1234567891011": {
+    "name": "示例项目群",
+    "trusted": true,
+    "type": "project",
+    "auto_reply": true,
+    "only_when_mentioned": true
+  }
+}

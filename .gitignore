@@ -1,0 +1,14 @@
+config/owner.json
+config/contacts.json
+config/groups.json
+config/routing.json
+config/auto-reply.json
+config/policies.json
+runtime/agent-state.json
+runtime/tasks/*.json
+runtime/items/*.json
+runtime/approvals/*.json
+runtime/actions/*.json
+runtime/logs/*.jsonl
+runtime/raw/*
+!runtime/**/.gitkeep
