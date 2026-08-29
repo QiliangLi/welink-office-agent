@@ -8,7 +8,7 @@
     "preflight": "node .claude/skills/welink-office-agent/scripts/agent.mjs preflight",
     "status": "node .claude/skills/welink-office-agent/scripts/agent.mjs status",
     "resume": "node .claude/skills/welink-office-agent/scripts/agent.mjs resume",
-    "test": "node --test"
+    "test": "node --test test/*.test.mjs"
   },
   "engines": {
     "node": ">=18"

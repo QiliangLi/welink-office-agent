@@ -15,3 +15,6 @@ runtime/raw/*
 
 # macOS
 .DS_Store
+
+# Local UI craft notes
+.finesse/
