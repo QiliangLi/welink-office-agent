@@ -12,3 +12,6 @@ runtime/actions/*.json
 runtime/logs/*.jsonl
 runtime/raw/*
 !runtime/**/.gitkeep
+
+# macOS
+.DS_Store
