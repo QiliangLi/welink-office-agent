@@ -920,3 +920,98 @@ test('slot acquired then task completes concurrently: refused send frees the slo
   assert.equal(next.queued, false);
   assert.equal((await store.listConversations()).filter((entry) => entry.status === 'active').length, 1, 'exactly the new task holds the slot');
 });
+
+test('busy slot: terminal task is refused instead of queued and never promoted (V-01)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+  const sends = new SendService(store);
+
+  // Task A holds the slot (a real send).
+  const taskA = await tasks.createTask({ request: '持槽任务 A' });
+  const subA = await tasks.addSubtask(taskA.task_id, { title: '询问王璐', target_employee_number: '00123456' });
+  await sends.sendUser({ employeeNumber: '00123456', text: 'A 的问题', taskId: taskA.task_id, subtaskId: subA.subtask_id });
+
+  // Task B is already terminal; the host works from a stale snapshot and
+  // calls sendUser while the slot is busy.
+  const taskB = await tasks.createTask({ request: '终态任务 B' });
+  const subB = await tasks.addSubtask(taskB.task_id, { title: '联系王璐', target_employee_number: '00123456' });
+  await tasks.updateSubtask(taskB.task_id, subB.subtask_id, { status: 'completed' });
+  await tasks.completeTask(taskB.task_id);
+
+  await assert.rejects(
+    () => sends.sendUser({ employeeNumber: '00123456', text: '迟到的询问', taskId: taskB.task_id, subtaskId: subB.subtask_id }),
+    (error) => error.code === 'INVALID_STATE_TRANSITION' && error.terminalRefusal === true,
+  );
+
+  // Task B must NOT be parked in the wait queue.
+  const taskBAfter = await store.loadTask(taskB.task_id);
+  const subBAfter = taskBAfter.subtasks.find((entry) => entry.subtask_id === subB.subtask_id);
+  assert.equal(subBAfter.waiting_kind, null, 'terminal task is not queued');
+  assert.equal(subBAfter.queue_entered_at, null);
+  assert.equal(subBAfter.blocked_by_task_id, null);
+
+  // Releasing A's slot must not hand the conversation to the terminal task.
+  const conversations = await store.listConversations();
+  const activeA = conversations.find((entry) => entry.status === 'active' && entry.task_id === taskA.task_id);
+  const release = await (await import('../scripts/lib/contact-slots.mjs')).releaseContactSlot(store, activeA, { reason: 'replied' });
+  assert.equal(release.released, true);
+  assert.equal(release.promoted, null, 'terminal candidate is never promoted');
+  assert.equal((await store.listConversations()).filter((entry) => entry.status === 'active').length, 0, 'no active conversation after release');
+
+  // A valid later task can still acquire the slot normally.
+  const taskC = await tasks.createTask({ request: '后续任务 C' });
+  const subC = await tasks.addSubtask(taskC.task_id, { title: '联系王璐', target_employee_number: '00123456' });
+  const next = await sends.sendUser({ employeeNumber: '00123456', text: 'C 的问题', taskId: taskC.task_id, subtaskId: subC.subtask_id });
+  assert.equal(next.queued, false);
+});
+
+test('release skips candidates whose task turned terminal while queued (V-01 promotion filter)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+  const sends = new SendService(store);
+  const { acquireContactSlot, releaseContactSlot } = await import('../scripts/lib/contact-slots.mjs');
+
+  // A holds the slot; B and C queue behind it.
+  const taskA = await tasks.createTask({ request: '持槽任务 A' });
+  const subA = await tasks.addSubtask(taskA.task_id, { title: '询问王璐', target_employee_number: '00123456' });
+  await sends.sendUser({ employeeNumber: '00123456', text: 'A 的问题', taskId: taskA.task_id, subtaskId: subA.subtask_id });
+
+  const taskB = await tasks.createTask({ request: '排队后取消的任务 B' });
+  const subB = await tasks.addSubtask(taskB.task_id, { title: '联系王璐', target_employee_number: '00123456' });
+  const queuedB = await acquireContactSlot(store, { contactType: 'user', contactId: '00123456', taskId: taskB.task_id, subtaskId: subB.subtask_id });
+  assert.equal(queuedB.acquired, false);
+
+  const taskC = await tasks.createTask({ request: '正常排队的任务 C' });
+  const subC = await tasks.addSubtask(taskC.task_id, { title: '联系王璐', target_employee_number: '00123456' });
+  const queuedC = await acquireContactSlot(store, { contactType: 'user', contactId: '00123456', taskId: taskC.task_id, subtaskId: subC.subtask_id });
+  assert.equal(queuedC.acquired, false);
+  assert.equal(queuedC.position, 2);
+
+  // B turns terminal while queued (owner cancelled it meanwhile).
+  await tasks.cancel(taskB.task_id);
+
+  // Releasing A skips B (cleaning its queue fields) and promotes C.
+  const activeA = (await store.listConversations()).find((entry) => entry.status === 'active' && entry.task_id === taskA.task_id);
+  const release = await releaseContactSlot(store, activeA, { reason: 'replied' });
+  assert.equal(release.released, true);
+  assert.equal(release.promoted.task_id, taskC.task_id, 'the next valid candidate is promoted');
+
+  const taskBAfter = await store.loadTask(taskB.task_id);
+  const subBAfter = taskBAfter.subtasks.find((entry) => entry.subtask_id === subB.subtask_id);
+  assert.equal(subBAfter.waiting_kind, null, 'terminal candidate queue fields are cleaned');
+  assert.equal(subBAfter.conversation_id, null);
+
+  const actives = (await store.listConversations()).filter((entry) => entry.status === 'active');
+  assert.equal(actives.length, 1);
+  assert.equal(actives[0].task_id, taskC.task_id);
+});

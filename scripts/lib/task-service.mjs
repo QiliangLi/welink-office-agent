@@ -1,4 +1,5 @@
 import { makeId } from './ids.mjs';
+import { releaseTaskConversations } from './contact-slots.mjs';
 import { nowIso } from './utils.mjs';
 
 /**
@@ -102,6 +103,9 @@ export class TaskService {
     await this.store.mutateState((state) => {
       state.active_task_ids = (state.active_task_ids ?? []).filter((id) => id !== taskId);
     });
+    // A conversation opened while the task was running must not keep
+    // blocking later tasks for the same contact (U-01/V-01 family).
+    await releaseTaskConversations(this.store, taskId, { reason: 'task_cancelled' });
     await this.store.logEvent('task_cancelled', { task_id: taskId, cancelled_commands: cancelledCommands.length });
     return { task, cancelledCommands };
   }
@@ -268,6 +272,9 @@ export class TaskService {
     await this.store.mutateState((state) => {
       state.active_task_ids = (state.active_task_ids ?? []).filter((id) => id !== taskId);
     });
+    // A conversation opened while the task was running must not keep
+    // blocking later tasks for the same contact (U-01/V-01 family).
+    await releaseTaskConversations(this.store, taskId, { reason: 'task_completed' });
     await this.store.logEvent('task_completed', { task_id: taskId });
     return { ok: true, task: completed };
   }

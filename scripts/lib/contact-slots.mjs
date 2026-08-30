@@ -55,23 +55,62 @@ export async function queuePositionFor(store, contactKey, taskId, subtaskId) {
   return index === -1 ? null : index + 1;
 }
 
+const TERMINAL_CHAT_STATUSES = ['completed', 'cancelled', 'failed', 'paused'];
+
+/**
+ * Release every active conversation a task still holds. Called when a task
+ * reaches a terminal state so a conversation created while the task was
+ * running cannot block later tasks for the same contact after the task is
+ * gone (U-01/V-01 family). Runs outside the task lock: releaseContactSlot
+ * takes its own slot lock, and slot locks are never taken while holding a
+ * task lock.
+ */
+export async function releaseTaskConversations(store, taskId, { reason = 'task_finished' } = {}) {
+  const conversations = await store.listConversations();
+  const released = [];
+  for (const conversation of conversations) {
+    if (conversation.task_id !== taskId || conversation.status !== 'active') continue;
+    const result = await releaseContactSlot(store, conversation, { reason });
+    if (result.released) released.push(conversation.conversation_id);
+  }
+  return released;
+}
+
+function terminalRefusal(taskId, status) {
+  const error = new Error(`Task ${taskId} is ${status}; contact slot acquisition refused.`);
+  error.code = 'INVALID_STATE_TRANSITION';
+  // Same marker as executeSend's terminal refusal: callers can tell "no
+  // conversation/queue entry was created" apart from real send failures.
+  error.terminalRefusal = true;
+  return error;
+}
+
 /**
  * Try to acquire the single active conversation slot for a contact. On
  * success a new active conversation is created and linked to the subtask;
  * on failure the subtask is parked in the contact queue and the holder
  * information is returned so callers can explain the wait.
+ *
+ * The task's terminal status is re-checked under the already-held slot+task
+ * lock BEFORE any queue entry or conversation is created (review V-01), so
+ * a stale-snapshot send for a finished task can neither park itself in the
+ * wait queue nor take the slot.
  */
 export async function acquireContactSlot(store, { contactType, contactId, taskId, subtaskId, priority = 'normal' }) {
   const contactKey = contactKeyFor(contactType, contactId);
   const taskLocks = [...new Set([`task:${taskId}`])];
 
   return store.locks.withLocks([`slot:${contactKey}`, ...taskLocks.sort()], async () => {
+    const task = await store.loadTask(taskId);
+    if (TERMINAL_CHAT_STATUSES.includes(task.status)) {
+      throw terminalRefusal(taskId, task.status);
+    }
+
     const conversations = await store.listConversations();
     const holder = conversations.find((entry) => entry.contact_key === contactKey && entry.status === 'active');
 
     if (!holder) {
       const conversation = await createConversation(store, { contactType, contactKey, taskId, subtaskId });
-      const task = await store.loadTask(taskId);
       const subtask = task.subtasks?.find((entry) => entry.subtask_id === subtaskId);
       if (subtask) {
         subtask.conversation_id = conversation.conversation_id;
@@ -90,7 +129,6 @@ export async function acquireContactSlot(store, { contactType, contactId, taskId
       return { acquired: true, conversation: holder, position: null, holderTaskId: taskId };
     }
 
-    const task = await store.loadTask(taskId);
     const subtask = task.subtasks?.find((entry) => entry.subtask_id === subtaskId);
     if (subtask) {
       if (subtask.status === 'ready_to_contact') subtask.status = 'waiting_contact_slot';
@@ -148,20 +186,39 @@ export async function releaseContactSlot(store, conversation, { reason = 'closed
     });
 
     const candidates = await collectWaitingCandidates(store, contactKey);
-    const next = candidates[0] ?? null;
     let promoted = null;
-    if (next) {
-      promoted = await store.locks.withLocks([`task:${next.task_id}`], async () => {
-        const task = await store.loadTask(next.task_id);
-        const subtask = task.subtasks?.find((entry) => entry.subtask_id === next.subtask_id);
+    // Promote candidates in stable order, skipping (and cleaning up) any
+    // whose task turned terminal while queued (review V-01) — promoting a
+    // finished task would hand the slot to a conversation nobody will use.
+    for (const candidate of candidates) {
+      const promotedForCandidate = await store.locks.withLocks([`task:${candidate.task_id}`], async () => {
+        const task = await store.loadTask(candidate.task_id);
+        const subtask = task.subtasks?.find((entry) => entry.subtask_id === candidate.subtask_id);
         // Re-check under the task lock: state may have moved on while we
         // were closing the previous conversation.
         if (!subtask || subtask.waiting_kind !== 'contact_slot') return null;
+        if (TERMINAL_CHAT_STATUSES.includes(task.status)) {
+          if (subtask.status === 'waiting_contact_slot') subtask.status = 'ready_to_contact';
+          subtask.waiting_kind = null;
+          subtask.waiting_reason = null;
+          subtask.blocked_by_task_id = null;
+          subtask.blocked_by_subtask_id = null;
+          subtask.queue_entered_at = null;
+          subtask.conversation_id = null;
+          await store.saveTask(task);
+          await store.logEvent('contact_slot_candidate_skipped', {
+            contact_key: contactKey,
+            task_id: candidate.task_id,
+            subtask_id: candidate.subtask_id,
+            task_status: task.status
+          });
+          return null;
+        }
         const nextConversation = await createConversation(store, {
           contactType: contactKey.startsWith('group:') ? 'group' : 'user',
           contactKey,
-          taskId: next.task_id,
-          subtaskId: next.subtask_id,
+          taskId: candidate.task_id,
+          subtaskId: candidate.subtask_id,
           openedBy: 'slot_release'
         });
         if (subtask.status === 'waiting_contact_slot') subtask.status = 'ready_to_contact';
@@ -172,16 +229,20 @@ export async function releaseContactSlot(store, conversation, { reason = 'closed
         subtask.queue_entered_at = null;
         subtask.conversation_id = nextConversation.conversation_id;
         await store.saveTask(task);
-        return { task_id: next.task_id, subtask_id: next.subtask_id, conversation_id: nextConversation.conversation_id };
+        return { task_id: candidate.task_id, subtask_id: candidate.subtask_id, conversation_id: nextConversation.conversation_id };
       });
-      if (promoted) {
-        await store.logEvent('contact_slot_acquired', {
-          conversation_id: promoted.conversation_id,
-          contact_key: contactKey,
-          task_id: promoted.task_id,
-          subtask_id: promoted.subtask_id
-        });
+      if (promotedForCandidate) {
+        promoted = promotedForCandidate;
+        break;
       }
+    }
+    if (promoted) {
+      await store.logEvent('contact_slot_acquired', {
+        conversation_id: promoted.conversation_id,
+        contact_key: contactKey,
+        task_id: promoted.task_id,
+        subtask_id: promoted.subtask_id
+      });
     }
     return { released: true, promoted };
   });
