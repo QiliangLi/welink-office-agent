@@ -178,6 +178,7 @@ function mapRuntimeEvent(entry) {
     case 'command_cancelled':
     case 'command_lease_recovered':
     case 'command_acknowledged':
+    case 'command_execution_started':
       return [{ event: 'command.updated', data: { commandId: entry.command_id ?? null, taskId: entry.aggregate_id ?? null } }];
     case 'action_started':
     case 'action_finished':

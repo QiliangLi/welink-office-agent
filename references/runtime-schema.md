@@ -67,11 +67,20 @@ One file per command with `command_id`, `type` (`task.create`, `task.resume`, `t
 
 Statuses: `queued` -> `claimed` (lease) -> `waiting_agent` (deterministic part done, Agent reasoning pending) -> `succeeded` | `failed` (retryable via `error.code`) | `cancelled`.
 
-Assignment delivery protocol: a command handed to the host Agent as a tick assignment keeps its lease with `assignment_state=delivered`. The host confirms ownership via `ack-command` (`assignment_state=acked`, lease cleared). Delivered-but-unacked commands return to `queued` when the lease expires (crash redelivery); acked commands are never re-queued or auto-cancelled — the host re-checks the assignment's `task_status` before acting. Task cancellation cancels queued/claimed commands and delivered-but-unacked assignments, never acked ones. `complete` refuses to resurrect a cancelled command.
+All transitions are monotonic and validated inside the record lock: a cancelled command can never enter waiting_agent/succeeded, `releaseClaim` only releases claimed commands, and `complete` on a cancelled command is a no-op. Scanning paths (claim/cancel/recover) hold the `commands` collection lock; cancellation takes the collection lock plus each record's lock, so it cannot interleave with a single-command writer.
+
+Assignment delivery protocol: a command handed to the host Agent as a tick assignment becomes `waiting_agent` with `assignment_state=delivered` and keeps its lease. The host confirms via `ack-command` (`assignment_state=acked`) and announces execution via `begin-command` (`assignment_state=executing`). Rules:
+
+- delivered + lease expired -> back to `queued` (redelivery after a host crash);
+- acked/executing are never auto-redelivered — a restarted host finds them through the `resume` listing (`pending_commands`);
+- task cancellation revokes queued/claimed/delivered/acked commands; executing ones stay with the host, which re-reads the task's persisted status before acting and reports the outcome via `complete-command`;
+- `complete`/`failed` on a cancelled command is a no-op — cancellation always wins.
 
 ## Idempotency records (`runtime/idempotency/*.json`)
 
-One file per hash of (owner, route pattern, Idempotency-Key), persisted by the Console API's unified idempotency layer: `{ key, fingerprint, route, status: in_progress|completed, status_code, response }`. Same key + same fingerprint (path + normalized body) replays the first response; same key with a different fingerprint is `409 IDEMPOTENCY_CONFLICT`. A dropped `in_progress` record (crash) frees the client to retry.
+One file per hash of (owner, route pattern, Idempotency-Key), persisted by the Console API's unified idempotency layer: `{ key, fingerprint, route, status, attempt_id, lease_until, status_code?, response? }`.
+
+Placeholder lifecycle: `reserved` (begin placed it, handler not started, short lease — an expired reservation is safely taken over by the next identical request with a fresh attempt id) -> `running` (handler executing, longer lease) -> `completed` (first response stored) or removed (handler failed before side effects). Same key + same fingerprint (path + normalized body) replays the first completed response; same key with a different fingerprint is `409 IDEMPOTENCY_CONFLICT`. A crash while `running` leaves the outcome unknown: replays get `409 IDEMPOTENCY_CONFLICT` with `details.phase="unknown_outcome"` and must query the affected aggregate (task/command status) instead of blindly retrying; such records are never auto-deleted.
 
 ## Conversations (`runtime/conversations/*.json`)
 

@@ -53,6 +53,13 @@ export class ApprovalService {
     if (itemId) targets.push({ kind: 'item', id: itemId });
     await this.store.mutateGroup(targets, {
       task: (task) => {
+        // Checked inside the task lock: a finished task cannot take new
+        // approvals, and a concurrent completion must not be re-opened.
+        if (['completed', 'cancelled', 'failed'].includes(task.status)) {
+          const error = new Error(`Task ${taskId} is ${task.status} and cannot take new approvals.`);
+          error.code = 'INVALID_STATE_TRANSITION';
+          throw error;
+        }
         task.pending_approval_ids = task.pending_approval_ids ?? [];
         if (!task.pending_approval_ids.includes(approvalId)) task.pending_approval_ids.push(approvalId);
         task.status = 'waiting_owner';

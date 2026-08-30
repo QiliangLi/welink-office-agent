@@ -447,3 +447,71 @@ test('server refuses non-loopback host binding (F-07)', async (t) => {
     assert.match(result.stderr, /loopback/, 'error explains the loopback boundary');
   }
 });
+
+test('idempotency crash recovery: expired reservation is taken over, running outcome stays unknown (R-04)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+  const { IdempotencyService } = await import('../server/services/idempotency-service.mjs');
+  const store = new Store(root);
+  await store.initialize();
+
+  const first = new IdempotencyService(store, { owner: '00000000' });
+  const beginArgs = { route: 'POST /api/v1/tasks', key: 'crash-key-0001', pathname: '/api/v1/tasks', body: { description: '崩溃恢复检查的任务描述' } };
+  const reserved = await first.begin(beginArgs);
+  assert.ok(reserved.key);
+  assert.ok(reserved.attemptId);
+
+  // Simulate a crash after reservation but before the handler ran: expire
+  // the reservation lease, then a fresh service instance (API restart) with
+  // the same key takes over safely.
+  const staleReserved = JSON.parse(JSON.stringify(await store.readIdempotency(reserved.key)));
+  staleReserved.lease_until = new Date(Date.now() - 60_000).toISOString();
+  await store.writeIdempotency(staleReserved);
+  const restarted = new IdempotencyService(store, { owner: '00000000' });
+  const takeover = await restarted.begin(beginArgs);
+  assert.ok(takeover.key, 'expired reservation is taken over');
+  assert.notEqual(takeover.attemptId, reserved.attemptId, 'takeover issues a fresh attempt');
+
+  // The stale attempt can no longer transition the placeholder to running.
+  await assert.rejects(() => restarted.markRunning(takeover.key, reserved.attemptId), /接管/);
+  await restarted.markRunning(takeover.key, takeover.attemptId);
+
+  // Crash while running: side effects are possible, so replays get a typed
+  // unknown-outcome conflict instead of a blind re-execution — even after
+  // the running lease expired.
+  const staleRunning = JSON.parse(JSON.stringify(await store.readIdempotency(takeover.key)));
+  staleRunning.lease_until = new Date(Date.now() - 60_000).toISOString();
+  await store.writeIdempotency(staleRunning);
+  await assert.rejects(async () => restarted.begin(beginArgs), (error) => {
+    assert.equal(error.code, 'IDEMPOTENCY_CONFLICT');
+    assert.equal(error.details.phase, 'unknown_outcome');
+    return true;
+  }, 'running records never auto-take-over');
+
+  // completed still replays normally.
+  await restarted.complete(takeover.key, 202, { task: { id: 'TASK-X' } });
+  const replay = await restarted.begin(beginArgs);
+  assert.deepEqual(replay.replay.response, { task: { id: 'TASK-X' } });
+
+  // fail() only drops our own reservation, never someone else's record.
+  const other = await restarted.begin({ ...beginArgs, key: 'crash-key-0002' });
+  await restarted.fail(other.key, 'ATT-not-the-owner');
+  assert.ok(await store.readIdempotency(other.key), 'foreign attempt cannot delete the record');
+  await restarted.fail(other.key, other.attemptId);
+  assert.equal(await store.readIdempotency(other.key), null);
+});
+
+test('HTTP layer surfaces the idempotency key to handlers and returns fresh revision (observations)', async (t) => {
+  const { post, headers, json, root } = await bootstrap(t);
+  const created = await post('/tasks', { description: '响应 revision 一致性检查任务。' }, { ...headers, 'idempotency-key': 'idem-rev-check-1' });
+  assert.equal(created.status, 202);
+
+  const detail = await json(`/tasks/${created.body.task.id}`);
+  assert.equal(created.body.task.revision, detail.body.task.revision, 'create response revision matches disk');
+
+  // The command carries the client idempotency key for traceability.
+  const store = new Store(root);
+  await store.initialize();
+  const command = (await store.listCommands()).find((entry) => entry.type === 'task.create');
+  assert.equal(command.idempotency_key, 'idem-rev-check-1');
+});

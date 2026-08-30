@@ -20,7 +20,7 @@ export function register(register, context) {
     reply(200, result);
   }, { querySchema: taskListQuerySchema });
 
-  register('POST', '/api/v1/tasks', async ({ reply, body, context }) => {
+  register('POST', '/api/v1/tasks', async ({ reply, body, context, idempotencyKey }) => {
     const result = await context.consoleCommandService.createTaskFromConsole(
       {
         description: body.description,
@@ -30,7 +30,7 @@ export function register(register, context) {
         executionMode: body.executionMode,
         attachmentIds: body.attachmentIds ?? []
       },
-      { idempotencyKey: body.__idempotencyKey, requestedBy: context.ownerEmployeeNumber }
+      { idempotencyKey, requestedBy: context.ownerEmployeeNumber }
     );
     reply(202, {
       task: { id: result.task.task_id, revision: result.task.revision, displayStatus: 'queued' },

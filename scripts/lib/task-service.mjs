@@ -245,18 +245,24 @@ export class TaskService {
   }
 
   async completeTask(taskId, { summary, force = false, expectedRevision = undefined } = {}) {
-    const actions = await this.store.listActions();
-    const task = await this.store.loadTask(taskId);
-    const blocking = this.completionBlockers(task, { actions });
-    const hasBlocking = Object.values(blocking).some((entries) => (Array.isArray(entries) ? entries.length > 0 : entries));
-    if (hasBlocking && !force) {
-      return { ok: false, reason: 'Task still has blocking work.', blocking };
-    }
-    const completed = await this.store.mutateTask(taskId, expectedRevision, (current) => {
+    // Blockers are re-evaluated INSIDE the task lock against the freshest
+    // snapshot, and the actions listing is re-read within the same window:
+    // work that lands concurrently (pending approval, instruction, send in
+    // flight) reliably blocks completion no matter which write wins the lock.
+    let rejection = null;
+    const completed = await this.store.mutateTask(taskId, expectedRevision, async (current) => {
+      const freshActions = await this.store.listActions();
+      const blocking = this.completionBlockers(current, { actions: freshActions });
+      const hasBlocking = Object.values(blocking).some((entries) => (Array.isArray(entries) ? entries.length > 0 : entries));
+      if (hasBlocking && !force) {
+        rejection = { ok: false, reason: 'Task still has blocking work.', blocking };
+        return;
+      }
       current.status = 'completed';
       current.final_summary = summary ?? current.final_summary;
       current.completed_at = nowIso();
     });
+    if (rejection) return rejection;
     await this.store.mutateState((state) => {
       state.active_task_ids = (state.active_task_ids ?? []).filter((id) => id !== taskId);
     });

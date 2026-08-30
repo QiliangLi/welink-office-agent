@@ -40,10 +40,11 @@ export class ConsoleCommandService {
       idempotencyKey,
       requestedBy
     });
-    await this.store.mutateTask(task.task_id, undefined, (current) => {
+    // Return the post-mutation snapshot so the response revision matches disk.
+    const updatedTask = await this.store.mutateTask(task.task_id, undefined, (current) => {
       current.queued_command_id = command.command_id;
     });
-    return { task, command };
+    return { task: updatedTask, command };
   }
 
   async applyTaskCommand(taskId, { type, expectedRevision, text }) {

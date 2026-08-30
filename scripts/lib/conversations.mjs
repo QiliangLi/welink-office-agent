@@ -68,9 +68,13 @@ export async function listConversationsForContact(store, contactKey) {
  * 1. explicit reply/thread markers match correlation_id or conversation_id
  *    across ALL conversations of the contact — a closed conversation still
  *    owns its late replies (delayed-response case, docs §5.2.1);
- * 2. exactly one ACTIVE conversation for the contact wins;
- * 3. no active conversation -> unattributed (owner/recovery path);
- * 4. multiple active candidates -> unresolved_multiple, never guess by
+ * 2. an explicit marker that matches NOTHING is reported unattributed with
+ *    reason `explicit_marker_unmatched` — it must never fall through to the
+ *    unique-active heuristic, or a reply aimed at some other context gets
+ *    written onto whatever task currently holds the contact slot;
+ * 3. exactly one ACTIVE conversation for the contact wins (no marker only);
+ * 4. no active conversation -> unattributed (owner/recovery path);
+ * 5. multiple active candidates -> unresolved_multiple, never guess by
  *    time or name.
  */
 export function attributeReply({ conversations, activeConversations, replyToActionId = null, externalThreadId = null }) {
@@ -80,8 +84,9 @@ export function attributeReply({ conversations, activeConversations, replyToActi
       (externalThreadId && entry.conversation_id === externalThreadId)
     );
     if (exact) return { status: 'attributed', conversation: exact };
+    return { status: 'unattributed', reason: 'explicit_marker_unmatched', conversation: null };
   }
   if (activeConversations.length === 1) return { status: 'attributed', conversation: activeConversations[0] };
-  if (activeConversations.length === 0) return { status: 'unattributed', conversation: null };
-  return { status: 'unresolved_multiple', conversation: null };
+  if (activeConversations.length === 0) return { status: 'unattributed', reason: 'no_active_conversation', conversation: null };
+  return { status: 'unresolved_multiple', reason: 'multiple_active_candidates', conversation: null };
 }

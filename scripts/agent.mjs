@@ -55,6 +55,7 @@ function usage() {
       tick: '[--max-commands 10] 消费 UI 命令队列并输出待 Agent 推理的分配',
       'complete-command': '--command-id <ID> [--status succeeded|failed] [--error-code <CODE>] [--error-message <文本>]',
       'ack-command': '--command-id <ID> 宿主 Agent 确认接手 waiting_agent assignment',
+      'begin-command': '--command-id <ID> 宿主 Agent 宣布开始执行 assignment（此后取消不再撤销，由宿主核对任务状态并回写结果）',
       'close-conversation': '--conversation-id <ID> [--reason <原因>] 释放联系人沟通槽并唤醒下一项',
       status: '[--task-id <ID>]',
       resume: '输出所有未完成任务、待确认事项和不确定动作',
@@ -146,13 +147,27 @@ async function runTick() {
     }
     const taskStatusForAssignment = task?.status ?? null;
 
+    /**
+     * Deliver an assignment to the host Agent. markWaitingAgent validates
+     * the transition under the record lock: if the command was cancelled
+     * between claim and delivery, the status stays cancelled and the
+     * assignment is NOT emitted.
+     */
+    const deliverAssignment = async (assignment) => {
+      const record = await commands.markWaitingAgent(claimed.command_id);
+      if (record.status !== 'waiting_agent') {
+        skipCommandIds.add(claimed.command_id);
+        return false;
+      }
+      assignments.push({ ...assignment, task_status: taskStatusForAssignment });
+      return true;
+    };
+
     if (claimed.type === 'task.create') {
-      await commands.markWaitingAgent(claimed.command_id);
-      assignments.push({
+      await deliverAssignment({
         kind: 'plan_task',
         command_id: claimed.command_id,
         task_id: claimed.aggregate_id,
-        task_status: taskStatusForAssignment,
         description: task.original_request,
         priority: task.priority
       });
@@ -160,26 +175,22 @@ async function runTick() {
     }
 
     if (claimed.type === 'task.instruction') {
-      await commands.markWaitingAgent(claimed.command_id);
-      assignments.push({ kind: 'handle_instruction', command_id: claimed.command_id, task_id: claimed.aggregate_id, task_status: taskStatusForAssignment, text: claimed.payload.text });
+      await deliverAssignment({ kind: 'handle_instruction', command_id: claimed.command_id, task_id: claimed.aggregate_id, text: claimed.payload.text });
       continue;
     }
 
     if (claimed.type === 'task.resume') {
-      await commands.markWaitingAgent(claimed.command_id);
-      assignments.push({ kind: 'resume_task', command_id: claimed.command_id, task_id: claimed.aggregate_id, task_status: taskStatusForAssignment });
+      await deliverAssignment({ kind: 'resume_task', command_id: claimed.command_id, task_id: claimed.aggregate_id });
       continue;
     }
 
     if (claimed.type === 'task.cancel') {
-      await commands.markWaitingAgent(claimed.command_id);
-      assignments.push({ kind: 'cancel_task', command_id: claimed.command_id, task_id: claimed.aggregate_id, task_status: taskStatusForAssignment });
+      await deliverAssignment({ kind: 'cancel_task', command_id: claimed.command_id, task_id: claimed.aggregate_id });
       continue;
     }
 
     if (claimed.type === 'task.retry') {
-      await commands.markWaitingAgent(claimed.command_id);
-      assignments.push({ kind: 'retry_task', command_id: claimed.command_id, task_id: claimed.aggregate_id, task_status: taskStatusForAssignment });
+      await deliverAssignment({ kind: 'retry_task', command_id: claimed.command_id, task_id: claimed.aggregate_id });
       continue;
     }
 
@@ -257,13 +268,11 @@ async function runTick() {
         }
         continue;
       }
-      await commands.markWaitingAgent(claimed.command_id);
-      assignments.push({
+      await deliverAssignment({
         kind: 'apply_decision',
         command_id: claimed.command_id,
         approval_id: approval.approval_id,
         task_id: approval.task_id,
-        task_status: taskStatusForAssignment,
         subtask_id: approval.subtask_id,
         decision_payload: payload,
         proposed_action: proposedAction
@@ -310,12 +319,16 @@ async function runTick() {
         executed.push({ command_id: claimed.command_id, status: 'failed', error: 'CONTACT_SLOT_QUEUED' });
         continue;
       }
-      const updatedTask = await loadTaskCached(task.task_id, true);
-      const fresh = findSubtask(updatedTask, subtaskId);
-      fresh.communication.reminder_count += 1;
+      // Bump the reminder counters inside the task lock so a concurrent
+      // console instruction/agent write to the same task is never lost.
       const intervalMs = (reminder.reminder_interval_hours ?? 4) * 3_600_000;
-      fresh.communication.next_reminder_at = new Date(Date.now() + intervalMs).toISOString();
-      await store.saveTask(updatedTask);
+      const nextReminderAt = new Date(Date.now() + intervalMs).toISOString();
+      await store.mutateTask(task.task_id, undefined, (current) => {
+        const fresh = current.subtasks?.find((entry) => entry.subtask_id === subtaskId);
+        if (!fresh) return;
+        fresh.communication.reminder_count = (fresh.communication?.reminder_count ?? 0) + 1;
+        fresh.communication.next_reminder_at = nextReminderAt;
+      });
       await commands.complete(claimed.command_id, { status: 'succeeded' });
       executed.push({ command_id: claimed.command_id, status: 'succeeded', action_id: outcome.action.action_id, action_status: outcome.action.status });
       continue;
@@ -778,6 +791,15 @@ async function main() {
       const acked = await commands.ackCommand(commandId);
       await store.logEvent('command_acknowledged', { command_id: commandId });
       jsonOutput({ ok: true, command: acked });
+      return;
+    }
+
+    case 'begin-command': {
+      await ensureInitialized();
+      const commandId = requireArg(args, 'command-id');
+      const begun = await commands.beginCommand(commandId);
+      await store.logEvent('command_execution_started', { command_id: commandId });
+      jsonOutput({ ok: true, command: begun });
       return;
     }
 

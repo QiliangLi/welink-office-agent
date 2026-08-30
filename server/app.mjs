@@ -59,14 +59,18 @@ export function createRouter(context) {
 
         // Unified persistent idempotency: same key + same target/body
         // replays the first response; same key with different input is a
-        // 409. The placeholder prevents concurrent duplicate execution.
+        // 409. The placeholder prevents concurrent duplicate execution and
+        // distinguishes "never started" (safe takeover) from "outcome
+        // unknown" (typed conflict, query the aggregate instead).
         let idempotencyKey = null;
+        let idempotencyRecordKey = null;
+        let idempotencyAttemptId = null;
         if (req.method === 'POST' && !matched.options.skipIdempotency) {
           const clientKey = req.headers['idempotency-key'];
           if (typeof clientKey !== 'string' || clientKey.length < 8) {
             throw toApiError(Object.assign(new Error('缺少 Idempotency-Key 请求头。'), { status: 400, code: 'VALIDATION_ERROR' }));
           }
-          const { replay, key } = await context.idempotencyService.begin({
+          const { replay, key, attemptId } = await context.idempotencyService.begin({
             route: matched.id,
             key: clientKey,
             pathname,
@@ -76,7 +80,9 @@ export function createRouter(context) {
             sendJson(res, replay.statusCode, replay.response, requestId);
             return;
           }
-          idempotencyKey = key;
+          idempotencyKey = clientKey;
+          idempotencyRecordKey = key;
+          idempotencyAttemptId = attemptId;
         }
 
         // Capture the response so the idempotency record can store it.
@@ -87,12 +93,15 @@ export function createRouter(context) {
         };
 
         try {
-          await matched.handler({ req, res, params, query, repeat, body, requestId, reply, context });
-          if (idempotencyKey && captured) {
-            await context.idempotencyService.complete(idempotencyKey, captured.status, captured.data ?? null);
+          if (idempotencyRecordKey) {
+            await context.idempotencyService.markRunning(idempotencyRecordKey, idempotencyAttemptId);
+          }
+          await matched.handler({ req, res, params, query, repeat, body, requestId, reply, context, idempotencyKey });
+          if (idempotencyRecordKey && captured) {
+            await context.idempotencyService.complete(idempotencyRecordKey, captured.status, captured.data ?? null);
           }
         } catch (handlerError) {
-          if (idempotencyKey) await context.idempotencyService.fail(idempotencyKey);
+          if (idempotencyRecordKey) await context.idempotencyService.fail(idempotencyRecordKey, idempotencyAttemptId);
           throw handlerError;
         }
       } catch (error) {

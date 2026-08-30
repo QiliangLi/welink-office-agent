@@ -390,7 +390,7 @@ test('message log entry is written before conversation mutation (F-05 ordering)'
   assert.notEqual(after.last_inbound_at, originalInboundAt, 'conversation updated only after the message record exists');
 });
 
-test('waiting_agent assignments: ack keeps ownership, lease expiry redelivers, cancel revokes (F-06)', async (t) => {
+test('assignment protocol: claim/cancel/deliver, ack/cancel/begin, lease redelivery (R-03)', async (t) => {
   const root = await createFixture();
   t.after(async () => fs.rm(root, { recursive: true, force: true }));
 
@@ -399,42 +399,41 @@ test('waiting_agent assignments: ack keeps ownership, lease expiry redelivers, c
   const commands = new CommandService(store);
   const tasks = new TaskService(store, commands);
 
-  const task = await tasks.createTask({ request: 'assignment 协议' });
-  const { command } = await commands.create({ type: 'task.create', aggregateType: 'task', aggregateId: task.task_id });
+  // --- Cancel between claim and delivery must win (no resurrection). ---
+  const task1 = await tasks.createTask({ request: 'claim 后取消' });
+  const { command: cmd1 } = await commands.create({ type: 'task.create', aggregateType: 'task', aggregateId: task1.task_id });
+  await commands.claimNext({ workerId: 'w1' });
+  await tasks.cancel(task1.task_id);
+  const delivered = await commands.markWaitingAgent(cmd1.command_id, { leaseMs: 60_000 });
+  assert.equal(delivered.status, 'cancelled', 'cancelled command never becomes waiting_agent');
+  await commands.complete(cmd1.command_id, { status: 'succeeded' });
+  assert.equal((await store.loadCommand(cmd1.command_id)).status, 'cancelled', 'complete cannot resurrect');
 
-  const claimed = await commands.claimNext({ workerId: 'w1' });
-  await commands.markWaitingAgent(claimed.command_id, { leaseMs: 60_000 });
-  let current = await store.loadCommand(command.command_id);
-  assert.equal(current.status, 'waiting_agent');
-  assert.equal(current.assignment_state, 'delivered');
-  assert.ok(current.lease_until, 'delivered assignment keeps its lease');
-
-  // Host acks: lease cleared, no longer recoverable or cancellable.
-  await commands.ackCommand(command.command_id);
-  current = await store.loadCommand(command.command_id);
-  assert.equal(current.assignment_state, 'acked');
-  assert.equal(current.lease_until, null);
-  assert.deepEqual(await commands.recoverExpiredLeases(), []);
-
-  // Acked assignments survive task cancellation (host re-checks task state).
-  await tasks.cancel(task.task_id);
-  current = await store.loadCommand(command.command_id);
-  assert.equal(current.status, 'waiting_agent', 'acked assignment is not cancelled');
-
-  // Unacked assignments ARE cancelled by task cancellation.
-  const task2 = await tasks.createTask({ request: '取消撤销' });
+  // --- Cancel revokes acked assignments; executing ones stay with host. ---
+  const task2 = await tasks.createTask({ request: 'acked 取消' });
   const { command: cmd2 } = await commands.create({ type: 'task.create', aggregateType: 'task', aggregateId: task2.task_id });
   await commands.claimNext({ workerId: 'w1' });
   await commands.markWaitingAgent(cmd2.command_id, { leaseMs: 60_000 });
+  await commands.ackCommand(cmd2.command_id);
+  let current = await store.loadCommand(cmd2.command_id);
+  assert.equal(current.assignment_state, 'acked');
+
   await tasks.cancel(task2.task_id);
-  const cancelledCmd = await store.loadCommand(cmd2.command_id);
-  assert.equal(cancelledCmd.status, 'cancelled', 'delivered-but-unacked assignment is revoked');
+  current = await store.loadCommand(cmd2.command_id);
+  assert.equal(current.status, 'cancelled', 'acked-but-not-started assignment is revoked by cancellation');
 
-  // Complete refuses to resurrect a cancelled command.
-  await commands.complete(cmd2.command_id, { status: 'succeeded' });
-  assert.equal((await store.loadCommand(cmd2.command_id)).status, 'cancelled');
+  const task2b = await tasks.createTask({ request: 'executing 保留' });
+  const { command: cmd2b } = await commands.create({ type: 'task.create', aggregateType: 'task', aggregateId: task2b.task_id });
+  await commands.claimNext({ workerId: 'w1' });
+  await commands.markWaitingAgent(cmd2b.command_id, { leaseMs: 60_000 });
+  await commands.ackCommand(cmd2b.command_id);
+  await commands.beginCommand(cmd2b.command_id);
+  await tasks.cancel(task2b.task_id);
+  current = await store.loadCommand(cmd2b.command_id);
+  assert.equal(current.status, 'waiting_agent', 'executing assignment survives cancellation');
+  assert.equal(current.assignment_state, 'executing');
 
-  // Delivered-but-unacked assignment with expired lease is redelivered.
+  // --- Recovery: delivered + expired lease is redelivered; acked is not. ---
   const task3 = await tasks.createTask({ request: '重投递' });
   const { command: cmd3 } = await commands.create({ type: 'task.create', aggregateType: 'task', aggregateId: task3.task_id });
   await commands.claimNext({ workerId: 'w1' });
@@ -442,9 +441,38 @@ test('waiting_agent assignments: ack keeps ownership, lease expiry redelivers, c
   const stale = await store.loadCommand(cmd3.command_id);
   stale.lease_until = new Date(Date.now() - 60_000).toISOString();
   await store.saveCommand(stale);
-  const recovered = await commands.recoverExpiredLeases();
-  assert.deepEqual(recovered, [cmd3.command_id], 'unacked assignment requeued after lease expiry');
+  assert.deepEqual(await commands.recoverExpiredLeases(), [cmd3.command_id], 'delivered assignment requeued after lease expiry');
   assert.equal((await store.loadCommand(cmd3.command_id)).status, 'queued');
+
+  // The restarted host re-claims the redelivered assignment and moves it to
+  // executing, taking it out of the queue.
+  await commands.claimNext({ workerId: 'w2' });
+  await commands.markWaitingAgent(cmd3.command_id, { leaseMs: 60_000 });
+  await commands.ackCommand(cmd3.command_id);
+  await commands.beginCommand(cmd3.command_id);
+
+  const task4 = await tasks.createTask({ request: 'acked 不重投' });
+  const { command: cmd4 } = await commands.create({ type: 'task.create', aggregateType: 'task', aggregateId: task4.task_id });
+  await commands.claimNext({ workerId: 'w1' });
+  await commands.markWaitingAgent(cmd4.command_id, { leaseMs: 60_000 });
+  await commands.ackCommand(cmd4.command_id);
+  const staleAcked = await store.loadCommand(cmd4.command_id);
+  staleAcked.lease_until = new Date(Date.now() - 60_000).toISOString();
+  await store.saveCommand(staleAcked);
+  assert.deepEqual(await commands.recoverExpiredLeases(), [], 'acked assignment is never auto-redelivered (resume protocol)');
+  assert.equal((await store.loadCommand(cmd4.command_id)).status, 'waiting_agent');
+
+  // --- begin/ack reject commands in the wrong state. ---
+  await assert.rejects(() => commands.ackCommand(cmd3.command_id), /not a delivered assignment/);
+  await assert.rejects(() => commands.beginCommand(cmd1.command_id), /not an acked assignment/);
+
+  // --- releaseClaim only releases claimed commands. ---
+  const task5 = await tasks.createTask({ request: 'releaseClaim 边界' });
+  const { command: cmd5 } = await commands.create({ type: 'task.create', aggregateType: 'task', aggregateId: task5.task_id });
+  await commands.claimNext({ workerId: 'w1' });
+  await tasks.cancel(task5.task_id);
+  await commands.releaseClaim(cmd5.command_id);
+  assert.equal((await store.loadCommand(cmd5.command_id)).status, 'cancelled', 'releaseClaim does not resurrect cancelled commands');
 });
 
 test('failed task retry reaches tick as a retry_task assignment (F-04 e2e)', async (t) => {
@@ -472,4 +500,126 @@ test('failed task retry reaches tick as a retry_task assignment (F-04 e2e)', asy
   // Host completes the assignment.
   const done = await runCli(root, ['complete-command', '--command-id', command.command_id, '--status', 'succeeded']);
   assert.equal(done.parsed.command.status, 'succeeded');
+});
+
+test('explicit-but-unknown reply marker never falls back to the active conversation (R-02 regression)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+  const sends = new SendService(store);
+  const messages = new MessageService(store);
+
+  // Task A's conversation exists but is closed; task B holds the only
+  // active conversation for the contact.
+  const taskA = await tasks.createTask({ request: '历史任务 A' });
+  const subA = await tasks.addSubtask(taskA.task_id, { title: 'A 询问', target_employee_number: '00123456' });
+  const sendA = await sends.sendUser({ employeeNumber: '00123456', text: 'A 的问题', taskId: taskA.task_id, subtaskId: subA.subtask_id });
+  const { releaseContactSlot } = await import('../scripts/lib/contact-slots.mjs');
+  await releaseContactSlot(store, await store.loadConversation(sendA.action.conversation_id), { reason: 'closed' });
+
+  const taskB = await tasks.createTask({ request: '当前任务 B' });
+  const subB = await tasks.addSubtask(taskB.task_id, { title: 'B 询问', target_employee_number: '00123456' });
+  await sends.sendUser({ employeeNumber: '00123456', text: 'B 的问题', taskId: taskB.task_id, subtaskId: subB.subtask_id });
+
+  // A reply carrying a marker that matches no local record: must NOT be
+  // attributed to B just because B is the unique active conversation.
+  const unknown = await messages.recordInbound({
+    participantType: 'user',
+    participantId: '00123456',
+    content: '这句是别处的回复',
+    replyToActionId: 'ACT-UNKNOWN-000000'
+  });
+  assert.equal(unknown.attribution.status, 'unattributed');
+  assert.equal(unknown.attribution.reason, 'explicit_marker_unmatched');
+  assert.equal(unknown.message.task_id, null, 'task B is not polluted');
+  assert.equal(unknown.message.subtask_id, null);
+  assert.equal(unknown.message.conversation_id, null);
+
+  // Same for an unknown thread id.
+  const unknownThread = await messages.recordInbound({
+    participantType: 'user',
+    participantId: '00123456',
+    content: '另一句别处的回复',
+    externalThreadId: 'CONV-UNKNOWN-000000'
+  });
+  assert.equal(unknownThread.attribution.status, 'unattributed');
+  assert.equal(unknownThread.attribution.reason, 'explicit_marker_unmatched');
+  assert.equal(unknownThread.message.task_id, null);
+});
+
+test('concurrent reminder send and console instruction both persist (R-01 barrier regression)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+
+  const task = await tasks.createTask({ request: '催办并发任务' });
+  const subtask = await tasks.addSubtask(task.task_id, { title: '询问张三', target_employee_number: '00123456', required_information: ['状态'] });
+  await tasks.updateSubtask(task.task_id, subtask.subtask_id, { status: 'waiting_reply' });
+  const { command } = await commands.create({
+    type: 'subtask.remind',
+    aggregateType: 'task',
+    aggregateId: task.task_id,
+    payload: { task_id: task.task_id, subtask_id: subtask.subtask_id }
+  });
+
+  // Real cross-process race: tick (separate process) bumps the reminder
+  // counters while the console path appends instructions to the same task.
+  const { runCli } = await import('./helpers.mjs');
+  await Promise.all([
+    runCli(root, ['tick']),
+    tasks.addInstruction(task.task_id, '先只汇总市场反馈'),
+    tasks.addInstruction(task.task_id, '不要联系财务')
+  ]);
+
+  const finalTask = await store.loadTask(task.task_id);
+  assert.equal(finalTask.instructions.length, 2, 'concurrent instructions are not lost');
+  const fresh = finalTask.subtasks.find((entry) => entry.subtask_id === subtask.subtask_id);
+  assert.equal(fresh.communication.reminder_count, 1, 'reminder counted exactly once');
+  assert.ok(fresh.communication.next_reminder_at, 'reminder due time recorded');
+  assert.equal((await store.loadCommand(command.command_id)).status, 'succeeded');
+});
+
+test('completion re-evaluates blockers inside the task lock (R-01 regression)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+  const approvals = new ApprovalService(store, commands);
+
+  const task = await tasks.createTask({ request: '完成竞态任务' });
+  const subtask = await tasks.addSubtask(task.task_id, { title: '已完成部分', target_employee_number: '00123456' });
+  await tasks.updateSubtask(task.task_id, subtask.subtask_id, { status: 'completed' });
+
+  // Race: complete-task vs a pending approval landing on the same task.
+  // The lock re-check must let completion win ONLY when it truly ran first;
+  // afterwards a new approval can never attach to a completed task.
+  const results = await Promise.allSettled([
+    tasks.completeTask(task.task_id, { summary: '竞态完成' }),
+    approvals.createApproval({ taskId: task.task_id, question: '竞态审批？' })
+  ]);
+
+  const finalTask = await store.loadTask(task.task_id);
+  const completion = results[0];
+  const approvalResult = results[1];
+  if (completion.status === 'fulfilled' && completion.value.ok) {
+    assert.equal(finalTask.status, 'completed');
+    assert.equal(approvalResult.status, 'rejected', 'approval cannot attach to a completed task');
+    assert.equal(finalTask.pending_approval_ids.length, 0);
+  } else {
+    assert.equal(finalTask.status, 'waiting_owner', 'approval landed first and blocks completion');
+    assert.equal(approvalResult.status, 'fulfilled');
+    assert.equal(finalTask.pending_approval_ids.length, 1);
+    assert.notEqual(finalTask.status, 'completed', 'completion never rides over fresh blockers');
+  }
 });

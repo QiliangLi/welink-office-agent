@@ -45,6 +45,7 @@ export class MessageService {
       subtask_id: attributed?.subtask_id ?? subtaskId ?? null,
       conversation_id: attributed?.conversation_id ?? null,
       attribution_status: attribution.status,
+      attribution_reason: attribution.reason ?? null,
       status: 'recorded'
     });
 
@@ -59,6 +60,7 @@ export class MessageService {
       log_id: entry.log_id,
       contact_key: contactKey,
       attribution_status: attribution.status,
+      attribution_reason: attribution.reason ?? null,
       conversation_id: attributed?.conversation_id ?? null,
       task_id: attributed?.task_id ?? null,
       subtask_id: attributed?.subtask_id ?? null
