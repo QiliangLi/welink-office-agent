@@ -1,7 +1,7 @@
 import { hashText, makeId } from './ids.mjs';
 import { nowIso } from './utils.mjs';
 import { runWelink } from './welink.mjs';
-import { acquireContactSlot } from './contact-slots.mjs';
+import { acquireContactSlot, releaseContactSlot } from './contact-slots.mjs';
 
 function agentSuffix(policies, metadata = {}) {
   const meta = Object.entries(metadata)
@@ -76,6 +76,9 @@ export class SendService {
           if (['completed', 'cancelled', 'failed', 'paused'].includes(task.status)) {
             const error = new Error(`Task ${taskId} is ${task.status}; external send refused.`);
             error.code = 'INVALID_STATE_TRANSITION';
+            // Lets callers that already acquired resources for this send
+            // (e.g. the contact slot) roll them back — no action exists yet.
+            error.terminalRefusal = true;
             throw error;
           }
         }
@@ -181,18 +184,31 @@ export class SendService {
       conversation = slot.conversation;
     }
 
-    const { action, result } = await this.executeSend({
-      actionType: 'send_user_message',
-      targetType: 'user',
-      targetId: employeeNumber,
-      cliArgs: ['im', 'send-to-user', '--receiver', contact.w3account, '--text', message],
-      content: message,
-      taskId,
-      subtaskId,
-      messageType: type,
-      conversationId: conversation?.conversation_id ?? null,
-      rejectFinishedTask: true
-    });
+    // If the terminal-task refusal fires, the action intent was never
+    // created — release the contact slot we just acquired so the contact
+    // stays available for later tasks (review U-01). Releasing is idempotent
+    // and wakes the next queued candidate.
+    let sendOutcome;
+    try {
+      sendOutcome = await this.executeSend({
+        actionType: 'send_user_message',
+        targetType: 'user',
+        targetId: employeeNumber,
+        cliArgs: ['im', 'send-to-user', '--receiver', contact.w3account, '--text', message],
+        content: message,
+        taskId,
+        subtaskId,
+        messageType: type,
+        conversationId: conversation?.conversation_id ?? null,
+        rejectFinishedTask: true
+      });
+    } catch (error) {
+      if (conversation && error?.code === 'INVALID_STATE_TRANSITION' && error?.terminalRefusal) {
+        await releaseContactSlot(this.store, conversation, { reason: 'send_refused_terminal_task' });
+      }
+      throw error;
+    }
+    const { action, result } = sendOutcome;
     if (conversation) {
       await this.store.mutateConversation(conversation.conversation_id, (current) => {
         current.correlation_id = action.action_id;

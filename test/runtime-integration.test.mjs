@@ -839,3 +839,84 @@ test('createApproval on a terminal task leaves no orphan pending record (T-05)',
     assert.equal((await store.loadTask(task.task_id)).pending_approval_ids.length, 0);
   }
 });
+
+test("rejected terminal-task sendUser leaves no active conversation behind (U-01)", async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+  const sends = new SendService(store);
+
+  const taskA = await tasks.createTask({ request: '已完成任务 A' });
+  const subA = await tasks.addSubtask(taskA.task_id, { title: '询问王璐', target_employee_number: '00123456' });
+  await tasks.updateSubtask(taskA.task_id, subA.subtask_id, { status: 'completed' });
+  await tasks.completeTask(taskA.task_id);
+
+  // The host works from a stale snapshot and still tries to send for task A:
+  // the send must be refused AND must not leak the contact slot.
+  await assert.rejects(
+    () => sends.sendUser({ employeeNumber: '00123456', text: '迟到的询问', taskId: taskA.task_id, subtaskId: subA.subtask_id }),
+    (error) => error.code === 'INVALID_STATE_TRANSITION' && error.terminalRefusal === true,
+  );
+  const active = (await store.listConversations()).filter((entry) => entry.status === 'active');
+  assert.deepEqual(active, [], 'no active conversation survives the refused send');
+  assert.equal((await store.listActions()).filter((action) => action.task_id === taskA.task_id).length, 0, 'no action was created');
+
+  // The same contact is immediately available for the next task.
+  const taskB = await tasks.createTask({ request: '后续任务 B' });
+  const subB = await tasks.addSubtask(taskB.task_id, { title: '联系王璐', target_employee_number: '00123456' });
+  const next = await sends.sendUser({ employeeNumber: '00123456', text: 'B 的问题', taskId: taskB.task_id, subtaskId: subB.subtask_id });
+  assert.equal(next.queued, false, 'next task acquires the slot without waiting');
+});
+
+test('slot acquired then task completes concurrently: refused send frees the slot for the next task (U-01)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+  const sends = new SendService(store);
+
+  const taskA = await tasks.createTask({ request: '并发完成任务 A' });
+  const subA = await tasks.addSubtask(taskA.task_id, { title: '询问王璐', target_employee_number: '00123456' });
+
+  // Step 1: the send already passed the slot-acquisition stage (the host
+  // works from a pre-completion snapshot) — an active conversation exists.
+  const { acquireContactSlot } = await import('../scripts/lib/contact-slots.mjs');
+  const slot = await acquireContactSlot(store, {
+    contactType: 'user',
+    contactId: '00123456',
+    taskId: taskA.task_id,
+    subtaskId: subA.subtask_id
+  });
+  assert.equal(slot.acquired, true);
+  assert.equal(((await store.listConversations()).filter((entry) => entry.status === 'active')).length, 1);
+
+  // Step 2: the task completes concurrently.
+  await tasks.updateSubtask(taskA.task_id, subA.subtask_id, { status: 'completed' });
+  await tasks.completeTask(taskA.task_id);
+
+  // Step 3: sendUser resumes, re-acquires its OWN conversation, hits the
+  // terminal refusal and must roll the slot back.
+  await assert.rejects(
+    () => sends.sendUser({ employeeNumber: '00123456', text: '迟到的询问', taskId: taskA.task_id, subtaskId: subA.subtask_id }),
+    (error) => error.code === 'INVALID_STATE_TRANSITION',
+  );
+  assert.deepEqual(
+    (await store.listConversations()).filter((entry) => entry.status === 'active'),
+    [],
+    'own conversation is released after the refusal',
+  );
+
+  // Step 4: the next task for the same contact proceeds without queueing.
+  const taskB = await tasks.createTask({ request: '后续任务 B' });
+  const subB = await tasks.addSubtask(taskB.task_id, { title: '联系王璐', target_employee_number: '00123456' });
+  const next = await sends.sendUser({ employeeNumber: '00123456', text: 'B 的问题', taskId: taskB.task_id, subtaskId: subB.subtask_id });
+  assert.equal(next.queued, false);
+  assert.equal((await store.listConversations()).filter((entry) => entry.status === 'active').length, 1, 'exactly the new task holds the slot');
+});
