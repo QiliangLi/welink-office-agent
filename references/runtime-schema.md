@@ -63,9 +63,15 @@ Actions additionally carry `conversation_id` linking the send to its conversatio
 
 ## Commands (`runtime/commands/*.json`)
 
-One file per command with `command_id`, `type` (`task.create`, `task.resume`, `task.cancel`, `task.instruction`, `task.retry`, `subtask.remind`, `approval.apply`), `aggregate_type`/`aggregate_id`, `idempotency_key`, `payload`, `attempts`, `lease_until`, `error`.
+One file per command with `command_id`, `type` (`task.create`, `task.resume`, `task.cancel`, `task.instruction`, `task.retry`, `subtask.remind`, `approval.apply`), `aggregate_type`/`aggregate_id`, `idempotency_key`, `payload`, `attempts`, `lease_until`, `assignment_state`, `error`.
 
-Statuses: `queued` -> `claimed` (lease) -> `waiting_agent` (deterministic part done, Agent reasoning pending) -> `succeeded` | `failed` (retryable via `error.code`) | `cancelled`. Expired leases return to `queued` before the next claim; commands whose aggregate task is paused/cancelled stay queued or get cancelled, never executed.
+Statuses: `queued` -> `claimed` (lease) -> `waiting_agent` (deterministic part done, Agent reasoning pending) -> `succeeded` | `failed` (retryable via `error.code`) | `cancelled`.
+
+Assignment delivery protocol: a command handed to the host Agent as a tick assignment keeps its lease with `assignment_state=delivered`. The host confirms ownership via `ack-command` (`assignment_state=acked`, lease cleared). Delivered-but-unacked commands return to `queued` when the lease expires (crash redelivery); acked commands are never re-queued or auto-cancelled — the host re-checks the assignment's `task_status` before acting. Task cancellation cancels queued/claimed commands and delivered-but-unacked assignments, never acked ones. `complete` refuses to resurrect a cancelled command.
+
+## Idempotency records (`runtime/idempotency/*.json`)
+
+One file per hash of (owner, route pattern, Idempotency-Key), persisted by the Console API's unified idempotency layer: `{ key, fingerprint, route, status: in_progress|completed, status_code, response }`. Same key + same fingerprint (path + normalized body) replays the first response; same key with a different fingerprint is `409 IDEMPOTENCY_CONFLICT`. A dropped `in_progress` record (crash) frees the client to retry.
 
 ## Conversations (`runtime/conversations/*.json`)
 
@@ -73,7 +79,7 @@ One active conversation per `contact_key`. Fields: `conversation_id`, `contact_t
 
 ## Reply attribution
 
-Priority order: explicit reply/thread id (`correlation_id`/`conversation_id`) -> the single active conversation for the contact -> `unattributed` (no active conversation) -> `unresolved_multiple` (several candidates). Only `attributed` replies may advance a task; message log entries carry `attribution_status`, `conversation_id`, `task_id`, `subtask_id`.
+Priority order: explicit reply/thread id (`correlation_id`/`conversation_id`) matched across ALL conversations of the contact (closed ones included, so a late reply to a closed session lands on its original task) -> the single ACTIVE conversation for the contact -> `unattributed` (no active conversation) -> `unresolved_multiple` (several candidates). The raw message log entry is persisted before any related state is mutated. Only `attributed` replies may advance a task; message log entries carry `attribution_status`, `conversation_id`, `task_id`, `subtask_id`.
 
 ## Identity rules
 
@@ -90,8 +96,9 @@ Priority order: explicit reply/thread id (`correlation_id`/`conversation_id`) ->
 - `runtime/actions/*.json`: external action lifecycle.
 - `runtime/commands/*.json`: durable console command inbox with idempotency keys.
 - `runtime/conversations/*.json`: contact-slot conversations and reply linkage.
+- `runtime/idempotency/*.json`: Console API idempotency records.
 - `runtime/logs/messages.jsonl`: full communication log with monotonic `sequence` and attribution fields.
 - `runtime/logs/events.jsonl`: state-transition audit log with the same `sequence`.
 - `runtime/agent-state.json`: active task IDs, conversation cursors, tick timestamps, `log_sequence` counter.
 - `runtime/.locks/`: transient lock files (never committed).
-- All snapshot writes bump an integer `revision` under a file lock (`runtime/.locks/`); lock order is task -> approval -> item -> command, with `slot:<contact_key>` taken before task locks. Writers that expect a specific revision must pass `expectedRevision` through the Store's `mutate*` helpers.
+- All snapshot writes bump an integer `revision` under a file lock (`runtime/.locks/`); lock files carry an owner token and release only removes a matching token. Canonical lock order: `slot:<contact_key>` first, then task -> approval -> item -> command -> conversation -> action -> state (state only innermost). Writers that expect a specific revision must pass `expectedRevision` through the Store's `mutate*` helpers; `mutateGroup` updates related records inside one lock window keyed by kind+id.

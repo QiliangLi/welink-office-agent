@@ -11,6 +11,7 @@ runtime/approvals/*.json
 runtime/actions/*.json
 runtime/commands/*.json
 runtime/conversations/*.json
+runtime/idempotency/*.json
 runtime/.locks/*
 runtime/logs/*.jsonl
 runtime/raw/*

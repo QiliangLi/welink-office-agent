@@ -27,6 +27,7 @@ export class Store {
       actions: path.join(this.runtimeDir, 'actions'),
       commands: path.join(this.runtimeDir, 'commands'),
       conversations: path.join(this.runtimeDir, 'conversations'),
+      idempotency: path.join(this.runtimeDir, 'idempotency'),
       logs: path.join(this.runtimeDir, 'logs'),
       raw: path.join(this.runtimeDir, 'raw'),
       locks: path.join(this.runtimeDir, '.locks')
@@ -81,17 +82,25 @@ export class Store {
     await this.writeJson(this.paths().state, state);
   }
 
+  /** Locked mutation of agent-state.json; the only safe read-modify-write path. */
+  async mutateState(mutator) {
+    return this.locks.withLocks(['state'], async () => {
+      const state = await this.loadState();
+      await mutator(state);
+      await this.saveState(state);
+      return state;
+    });
+  }
+
   /**
    * Monotonic sequence shared by events.jsonl and messages.jsonl so merged
    * activity feeds keep a stable order for equal timestamps.
    */
   async nextSequence() {
     let value = 0;
-    await this.locks.withLocks(['state'], async () => {
-      const state = await this.loadState();
+    await this.mutateState((state) => {
       state.log_sequence = (state.log_sequence ?? 0) + 1;
       value = state.log_sequence;
-      await this.saveState(state);
     });
     return value;
   }
@@ -111,8 +120,9 @@ export class Store {
 
   /**
    * Read complete newline-terminated JSONL records starting at byte offset.
-   * A trailing partial line (mid-write) is not returned; its offset is
-   * reported back as the resume point so the next read retries it.
+   * A trailing partial line (mid-write) is not returned. Alongside each
+   * entry the end byte offset is reported so stream consumers can emit
+   * per-record cursors; `offset` is the resume point for the next read.
    */
   async readJsonl(fileName, { startOffset = 0 } = {}) {
     const filePath = path.join(this.paths().logs, fileName);
@@ -120,10 +130,10 @@ export class Store {
     try {
       stat = await fs.stat(filePath);
     } catch (error) {
-      if (error?.code === 'ENOENT') return { entries: [], offset: startOffset, size: 0 };
+      if (error?.code === 'ENOENT') return { entries: [], entryOffsets: [], offset: startOffset, size: startOffset };
       throw error;
     }
-    if (stat.size <= startOffset) return { entries: [], offset: startOffset, size: stat.size };
+    if (stat.size <= startOffset) return { entries: [], entryOffsets: [], offset: startOffset, size: stat.size };
 
     const handle = await fs.open(filePath, 'r');
     try {
@@ -132,18 +142,24 @@ export class Store {
       await handle.read(buffer, 0, length, startOffset);
       const text = buffer.toString('utf8');
       const complete = text.endsWith('\n') ? text : text.slice(0, text.lastIndexOf('\n') + 1);
-      const entries = complete
-        .split('\n')
-        .filter(Boolean)
-        .map((line) => {
-          try {
-            return JSON.parse(line);
-          } catch {
-            return null;
-          }
-        })
-        .filter(Boolean);
-      return { entries, offset: startOffset + Buffer.byteLength(complete, 'utf8'), size: stat.size };
+      const entries = [];
+      const entryOffsets = [];
+      let consumed = 0;
+      for (const line of complete.split('\n')) {
+        if (!line) continue;
+        const lineBytes = Buffer.byteLength(line, 'utf8') + 1;
+        let parsed;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        consumed += lineBytes;
+        entries.push(parsed);
+        entryOffsets.push(startOffset + consumed);
+      }
+      const offset = startOffset + Buffer.byteLength(complete, 'utf8');
+      return { entries, entryOffsets, offset, size: stat.size };
     } finally {
       await handle.close();
     }
@@ -199,6 +215,10 @@ export class Store {
 
   conversationPath(conversationId) {
     return path.join(this.paths().conversations, `${conversationId}.json`);
+  }
+
+  idempotencyPath(key) {
+    return path.join(this.paths().idempotency, `${key}.json`);
   }
 
   async loadTask(taskId) {
@@ -298,15 +318,15 @@ export class Store {
   /**
    * Locked mutation for one aggregate. Reloads the latest snapshot inside the
    * lock, verifies expectedRevision (when provided), runs the mutator, saves
-   * and returns the mutated record. The mutator may return an extra result.
+   * and returns the mutated record.
    */
   async mutateTask(taskId, expectedRevision, mutator) {
     return this.locks.withLocks([`task:${taskId}`], async () => {
       const task = await this.loadTask(taskId);
       this.checkRevision(task, expectedRevision, 'task');
-      const extra = await mutator(task);
+      await mutator(task);
       await this.saveTask(task);
-      return { record: task, extra };
+      return task;
     });
   }
 
@@ -314,9 +334,9 @@ export class Store {
     return this.locks.withLocks([`approval:${approvalId}`], async () => {
       const approval = await this.loadApproval(approvalId);
       this.checkRevision(approval, expectedRevision, 'approval');
-      const extra = await mutator(approval);
+      await mutator(approval);
       await this.saveApproval(approval);
-      return { record: approval, extra };
+      return approval;
     });
   }
 
@@ -324,9 +344,9 @@ export class Store {
     return this.locks.withLocks([`item:${itemId}`], async () => {
       const item = await this.loadItem(itemId);
       this.checkRevision(item, expectedRevision, 'item');
-      const extra = await mutator(item);
+      await mutator(item);
       await this.saveItem(item);
-      return { record: item, extra };
+      return item;
     });
   }
 
@@ -334,43 +354,70 @@ export class Store {
     return this.locks.withLocks([`command:${commandId}`], async () => {
       const command = await this.loadCommand(commandId);
       this.checkRevision(command, expectedRevision, 'command');
-      const extra = await mutator(command);
+      await mutator(command);
       await this.saveCommand(command);
-      return { record: command, extra };
+      return command;
+    });
+  }
+
+  async mutateAction(actionId, mutator) {
+    return this.locks.withLocks([`action:${actionId}`], async () => {
+      const action = await this.loadAction(actionId);
+      await mutator(action);
+      await this.saveAction(action);
+      return action;
+    });
+  }
+
+  async mutateConversation(conversationId, mutator) {
+    return this.locks.withLocks([`conversation:${conversationId}`], async () => {
+      const conversation = await this.loadConversation(conversationId);
+      await mutator(conversation);
+      await this.saveConversation(conversation);
+      return conversation;
     });
   }
 
   /**
-   * Multi-aggregate mutation with the canonical lock order
-   * task -> approval -> item -> command. `targets` lists
-   * { kind, id, expectedRevision? } entries; mutators[kind] receive the
-   * freshly loaded record and all snapshots are saved (same order) inside
-   * one lock window so related records stay consistent.
+   * Multi-aggregate mutation under the canonical lock order:
+   * task -> approval -> item -> command -> conversation -> action.
+   * `targets` lists { kind, id, expectedRevision? } entries; records are
+   * keyed by kind+id so the same group may include several records of one
+   * kind without overwriting each other. All snapshots are saved inside one
+   * lock window so related records stay consistent.
    */
   async mutateGroup(targets, mutators = {}) {
-    const order = { task: 0, approval: 1, item: 2, command: 3 };
+    const order = { task: 0, approval: 1, item: 2, command: 3, conversation: 4, action: 5 };
     const sorted = [...targets].sort((left, right) => order[left.kind] - order[right.kind]);
     const keys = sorted.map(({ kind, id }) => `${kind}:${id}`);
+    const loaders = {
+      task: (id) => this.loadTask(id),
+      approval: (id) => this.loadApproval(id),
+      item: (id) => this.loadItem(id),
+      command: (id) => this.loadCommand(id),
+      conversation: (id) => this.loadConversation(id),
+      action: (id) => this.loadAction(id)
+    };
+    const savers = {
+      task: (r) => this.saveTask(r),
+      approval: (r) => this.saveApproval(r),
+      item: (r) => this.saveItem(r),
+      command: (r) => this.saveCommand(r),
+      conversation: (r) => this.saveConversation(r),
+      action: (r) => this.saveAction(r)
+    };
     return this.locks.withLocks(keys, async () => {
-      const loaded = {};
-      const loaders = {
-        task: (id) => this.loadTask(id),
-        approval: (id) => this.loadApproval(id),
-        item: (id) => this.loadItem(id),
-        command: (id) => this.loadCommand(id)
-      };
+      const loaded = new Map();
       for (const target of sorted) {
-        loaded[target.kind] = await loaders[target.kind](target.id);
-        this.checkRevision(loaded[target.kind], target.expectedRevision, target.kind);
+        const record = await loaders[target.kind](target.id);
+        this.checkRevision(record, target.expectedRevision, target.kind);
+        loaded.set(`${target.kind}:${target.id}`, record);
       }
       for (const target of sorted) {
-        if (mutators[target.kind]) await mutators[target.kind](loaded[target.kind]);
+        if (mutators[target.kind]) await mutators[target.kind](loaded.get(`${target.kind}:${target.id}`));
       }
       for (const target of sorted) {
-        if (target.kind === 'task') await this.saveTask(loaded.task);
-        else if (target.kind === 'approval') await this.saveApproval(loaded.approval);
-        else if (target.kind === 'item') await this.saveItem(loaded.item);
-        else await this.saveCommand(loaded.command);
+        await savers[target.kind](loaded.get(`${target.kind}:${target.id}`));
       }
       return loaded;
     });
@@ -385,6 +432,20 @@ export class Store {
       error.details = { expectedRevision, currentRevision: current };
       throw error;
     }
+  }
+
+  async readIdempotency(key) {
+    return readOptionalJson(this.idempotencyPath(key), null);
+  }
+
+  async writeIdempotency(record) {
+    await this.writeJson(this.idempotencyPath(record.key), record);
+  }
+
+  async clearIdempotency(key) {
+    try {
+      await fs.rm(this.idempotencyPath(key), { force: true });
+    } catch { /* ignore */ }
   }
 
   async readRaw(fileName) {

@@ -1,6 +1,6 @@
 # WeLink Office Agent 前后端对接设计
 
-> **实现状态（2026-08-30）**：本文的推荐架构已按第 14 节的顺序落地——阶段一（只读真实数据）、阶段二（revision/文件锁/命令队列）、阶段三（tick 消费命令、联系人沟通槽、回复归属、completion policy 统一检查）、阶段四（SSE + heartbeat + snapshot.required）均已实现并有测试覆盖（`test/`、`server/`、`scripts/lib/`、`web-console/src/api/`）。阶段五（附件与产物）与第 16 节列出的内容保持“明确不做”，相关能力开关为 false。OpenAPI/contracts 自动生成仍为 proposed：契约目前以 `server/schemas/` 为源，手工镜像在 `web-console/src/api/contracts.ts`。
+> **实现状态（2026-08-30，评审修复后）**：本文的推荐架构已按第 14 节的顺序落地——阶段一（只读真实数据）、阶段二（revision/文件锁/命令队列）、阶段三（tick 消费命令、联系人沟通槽、回复归属、completion policy 统一检查）、阶段四（SSE + heartbeat + snapshot.required，含 per-record cursor 与日志截断恢复）均已实现并有测试覆盖（`test/`、`server/`、`scripts/lib/`、`web-console/src/api/`）。2026-08-30 评审（`docs/reviews/frontend-backend-integration-phase-1-4-review-2026-08-30.md`）提出的 7 项 findings 已全部修复：锁过期接管后重新竞争并带 owner token、全部并发写入收口到 mutation 锁、统一的持久化幂等层（`runtime/idempotency/`，owner+route+key 唯一约束）、failed 任务可消费 `task.retry`、延迟回复按显式标识归属到已关闭会话、waiting_agent assignment 带租约/ack/取消撤销协议、server 拒绝非 loopback 绑定。阶段五（附件与产物）与第 16 节列出的内容保持“明确不做”，相关能力开关为 false。OpenAPI/contracts 自动生成仍为 proposed：契约目前以 `server/schemas/` 为源，手工镜像在 `web-console/src/api/contracts.ts`。
 
 ## 1. 文档用途
 

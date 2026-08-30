@@ -5,6 +5,7 @@ import { nowIso } from './utils.mjs';
  * Deterministic task operations shared by the CLI and the Console API.
  * Console writes arrive with expectedRevision and are executed through
  * store.mutate* so a concurrent Skill/CLI edit can never be overwritten.
+ * Agent-state changes always go through store.mutateState.
  */
 
 export const TASK_STATUSES = ['queued', 'running', 'waiting_owner', 'paused', 'completed', 'cancelled', 'failed', 'reopened'];
@@ -63,9 +64,10 @@ export class TaskService {
       final_summary: null
     };
     await this.store.saveTask(task);
-    const state = await this.store.loadState();
-    if (!state.active_task_ids.includes(taskId)) state.active_task_ids.push(taskId);
-    await this.store.saveState(state);
+    await this.store.mutateState((state) => {
+      state.active_task_ids = state.active_task_ids ?? [];
+      if (!state.active_task_ids.includes(taskId)) state.active_task_ids.push(taskId);
+    });
     await this.store.logEvent(input.source === 'web_console' ? 'task_created_from_console' : 'task_created', {
       task_id: taskId,
       original_request: input.request,
@@ -75,68 +77,63 @@ export class TaskService {
     return task;
   }
 
-  async loadOwnedTask(taskId) {
-    const task = await this.store.loadTask(taskId);
-    return task;
-  }
-
   /** Immediate deterministic status change used by pause/cancel/resume. */
   async changeStatus(taskId, status, expectedRevision = undefined) {
-    const { record } = await this.store.mutateTask(taskId, expectedRevision, (task) => {
-      task.status = status;
+    const task = await this.store.mutateTask(taskId, expectedRevision, (current) => {
+      current.status = status;
       if (status === 'cancelled') {
-        task.cancelled_at = task.cancelled_at ?? nowIso();
+        current.cancelled_at = current.cancelled_at ?? nowIso();
       }
     });
     await this.store.logEvent('task_updated', { task_id: taskId, status });
-    return record;
+    return task;
   }
 
   async pause(taskId, expectedRevision) {
-    const record = await this.changeStatus(taskId, 'paused', expectedRevision);
+    const task = await this.changeStatus(taskId, 'paused', expectedRevision);
     await this.store.logEvent('task_paused', { task_id: taskId });
-    return record;
+    return task;
   }
 
   /** Cancel: deterministic status change plus cancelling unclaimed commands. */
   async cancel(taskId, expectedRevision) {
-    const record = await this.changeStatus(taskId, 'cancelled', expectedRevision);
+    const task = await this.changeStatus(taskId, 'cancelled', expectedRevision);
     const cancelledCommands = await this.commands.cancelQueuedForAggregate('task', taskId);
-    const state = await this.store.loadState();
-    state.active_task_ids = state.active_task_ids.filter((id) => id !== taskId);
-    await this.store.saveState(state);
+    await this.store.mutateState((state) => {
+      state.active_task_ids = (state.active_task_ids ?? []).filter((id) => id !== taskId);
+    });
     await this.store.logEvent('task_cancelled', { task_id: taskId, cancelled_commands: cancelledCommands.length });
-    return { task: record, cancelledCommands };
+    return { task, cancelledCommands };
   }
 
   async resume(taskId, expectedRevision) {
-    const record = await this.changeStatus(taskId, 'running', expectedRevision);
+    const task = await this.changeStatus(taskId, 'running', expectedRevision);
     const { command } = await this.commands.create({
       type: 'task.resume',
       aggregateType: 'task',
       aggregateId: taskId,
-      requestedBy: record.created_by_employee_number
+      requestedBy: task.created_by_employee_number
     });
-    return { task: record, commandId: command.command_id };
+    return { task, commandId: command.command_id };
   }
 
   async addInstruction(taskId, text, expectedRevision = undefined) {
-    const { record } = await this.store.mutateTask(taskId, expectedRevision, (task) => {
-      task.instructions = task.instructions ?? [];
-      task.instructions.push({ text, created_at: nowIso(), applied: false });
+    const task = await this.store.mutateTask(taskId, expectedRevision, (current) => {
+      current.instructions = current.instructions ?? [];
+      current.instructions.push({ text, created_at: nowIso(), applied: false });
     });
     const { command } = await this.commands.create({
       type: 'task.instruction',
       aggregateType: 'task',
       aggregateId: taskId,
       payload: { text },
-      requestedBy: record.created_by_employee_number
+      requestedBy: task.created_by_employee_number
     });
     await this.store.logEvent('task_instruction_added', { task_id: taskId, command_id: command.command_id });
-    return { task: record, commandId: command.command_id };
+    return { task, commandId: command.command_id };
   }
 
-  async createSubtask(task, input) {
+  createSubtask(task, input) {
     const sequence = (task.subtasks ?? []).length + 1;
     const subtask = {
       subtask_id: makeId('SUB'),
@@ -181,11 +178,13 @@ export class TaskService {
   }
 
   async addSubtask(taskId, input, expectedRevision = undefined) {
-    const { record, extra } = await this.store.mutateTask(taskId, expectedRevision, async (task) => {
-      const subtask = await this.createSubtask(task, input);
-      return { subtaskId: subtask.subtask_id };
+    let subtaskId = null;
+    const task = await this.store.mutateTask(taskId, expectedRevision, (current) => {
+      const subtask = this.createSubtask(current, input);
+      subtaskId = subtask.subtask_id;
     });
-    const subtask = record.subtasks.find((entry) => entry.subtask_id === extra.subtaskId);
+    const subtask = task.subtasks.find((entry) => entry.subtask_id === subtaskId);
+    if (!subtask) throw new Error(`Subtask not found after creation: ${subtaskId}`);
     await this.store.logEvent('subtask_created', {
       task_id: taskId,
       subtask_id: subtask.subtask_id,
@@ -196,8 +195,8 @@ export class TaskService {
   }
 
   async updateSubtask(taskId, subtaskId, patch, expectedRevision = undefined) {
-    const { record } = await this.store.mutateTask(taskId, expectedRevision, (task) => {
-      const subtask = task.subtasks.find((entry) => entry.subtask_id === subtaskId);
+    const task = await this.store.mutateTask(taskId, expectedRevision, (current) => {
+      const subtask = current.subtasks.find((entry) => entry.subtask_id === subtaskId);
       if (!subtask) throw new Error(`Subtask not found: ${subtaskId}`);
       if (patch.status !== undefined) subtask.status = patch.status;
       if (patch.summary !== undefined) subtask.summary = patch.summary;
@@ -209,17 +208,15 @@ export class TaskService {
       if (patch.next_action !== undefined) subtask.next_action = patch.next_action;
       if (patch.reply_received) subtask.communication.last_reply_at = nowIso();
       subtask.updated_at = nowIso();
-      return subtask;
     });
-    const subtask = record.subtasks.find((entry) => entry.subtask_id === subtaskId);
+    const subtask = task.subtasks.find((entry) => entry.subtask_id === subtaskId);
     await this.store.logEvent('subtask_updated', { task_id: taskId, subtask_id: subtaskId, status: subtask.status });
     return subtask;
   }
 
   /**
    * Unified completion check: every completion_policy declaration must be
-   * enforced, including waiting replies and uncertain actions which were
-   * previously only documented (docs §阶段三.6).
+   * enforced, including waiting replies and uncertain actions (docs §阶段三.6).
    */
   completionBlockers(task, { actions = [] } = {}) {
     const policy = task.completion_policy ?? {};
@@ -255,15 +252,15 @@ export class TaskService {
     if (hasBlocking && !force) {
       return { ok: false, reason: 'Task still has blocking work.', blocking };
     }
-    const { record } = await this.store.mutateTask(taskId, expectedRevision, (task) => {
-      task.status = 'completed';
-      task.final_summary = summary ?? task.final_summary;
-      task.completed_at = nowIso();
+    const completed = await this.store.mutateTask(taskId, expectedRevision, (current) => {
+      current.status = 'completed';
+      current.final_summary = summary ?? current.final_summary;
+      current.completed_at = nowIso();
     });
-    const state = await this.store.loadState();
-    state.active_task_ids = state.active_task_ids.filter((id) => id !== taskId);
-    await this.store.saveState(state);
+    await this.store.mutateState((state) => {
+      state.active_task_ids = (state.active_task_ids ?? []).filter((id) => id !== taskId);
+    });
     await this.store.logEvent('task_completed', { task_id: taskId });
-    return { ok: true, task: record };
+    return { ok: true, task: completed };
   }
 }

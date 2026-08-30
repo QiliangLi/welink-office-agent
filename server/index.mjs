@@ -10,6 +10,7 @@ import { TaskReadService } from './services/task-read-service.mjs';
 import { ApprovalReadService } from './services/approval-read-service.mjs';
 import { ConsoleCommandService } from './services/console-command-service.mjs';
 import { EventStreamService } from './services/event-stream-service.mjs';
+import { IdempotencyService } from './services/idempotency-service.mjs';
 import { makeCsrfToken } from './middleware/request-context.mjs';
 import * as healthRoutes from './routes/health.mjs';
 import * as overviewRoutes from './routes/overview.mjs';
@@ -20,6 +21,22 @@ import * as eventRoutes from './routes/events.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(here, '..');
+
+/**
+ * Network boundary (docs §11.1, review F-07): the console is a local,
+ * unauthenticated single-owner tool. Non-loopback binds are refused at
+ * startup; LAN support would require auth, TLS and owner authorization as
+ * a separate mode.
+ */
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
+
+function assertLoopbackHost(host) {
+  if (!LOOPBACK_HOSTS.has(host)) {
+    process.stderr.write(`Refusing to start: --host ${host} is not a loopback address.\n` +
+      'The console API has no authentication and must only listen on 127.0.0.1, localhost or ::1.\n');
+    process.exit(1);
+  }
+}
 
 function parseArgs(argv) {
   const options = { host: '127.0.0.1', port: 4174, static: true };
@@ -70,9 +87,10 @@ async function serveStatic(distDir, req, res) {
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) {
-    process.stdout.write(`welink-office-agent console API\n\nUsage:\n  node server/index.mjs [--host 127.0.0.1] [--port 4174] [--no-static]\n\nServes the console API under /api/v1. With --static (default) it also\nhosts web-console/dist/ for same-origin production-style local runs.\n`);
+    process.stdout.write(`welink-office-agent console API\n\nUsage:\n  node server/index.mjs [--host 127.0.0.1] [--port 4174] [--no-static]\n\nServes the console API under /api/v1. With --static (default) it also\nhosts web-console/dist/ for same-origin production-style local runs.\nOnly loopback hosts (127.0.0.1, localhost, ::1) are allowed.\n`);
     return;
   }
+  assertLoopbackHost(options.host);
 
   const store = new Store(projectRoot);
   await store.initialize();
@@ -85,6 +103,7 @@ async function main() {
     taskReadService: new TaskReadService(store),
     approvalReadService: new ApprovalReadService(store),
     eventStreamService: new EventStreamService(store),
+    idempotencyService: null,
     makeRequestId: () => `REQ-${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).slice(2, 6).toUpperCase()}`,
     csrfToken: makeCsrfToken(),
     mode: 'local',
@@ -100,6 +119,7 @@ async function main() {
     context._owner = null;
     context.ownerConfig = {};
   }
+  context.idempotencyService = new IdempotencyService(store, { owner: context._owner ?? 'local' });
   try {
     context.contactsConfig = await store.loadConfig('contacts');
   } catch {
@@ -146,6 +166,13 @@ async function main() {
   });
 
   await new Promise((resolve) => server.listen(options.port, options.host, resolve));
+  const address = server.address();
+  // Belt and suspenders: whatever was requested, verify what actually bound.
+  if (!address || !LOOPBACK_HOSTS.has(address.address)) {
+    process.stderr.write(`Refusing to serve: bound address ${address?.address ?? 'unknown'} is not loopback.\n`);
+    server.close();
+    process.exit(1);
+  }
   await context.eventStreamService.start();
 
   const stop = () => {
@@ -156,7 +183,6 @@ async function main() {
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);
 
-  const address = server.address();
   process.stdout.write(`Console API listening on http://${address.address}:${address.port}\n`);
   process.stdout.write(`Runtime: ${store.runtimeDir}\n`);
   process.stdout.write(`Static hosting: ${staticAvailable ? path.relative(projectRoot, distDir) : 'disabled'}\n`);

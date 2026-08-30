@@ -10,6 +10,9 @@ export const APPROVAL_DECISIONS = ['approve', 'reject', 'edit', 'select_option',
  * the user actually chose in decision_payload — a bare status cannot be
  * replayed by the Agent — and schedules an approval.apply command that the
  * tick consumes to perform the follow-up work.
+ *
+ * Approval, task and related item are updated inside one mutateGroup lock
+ * window so a concurrent Agent write to the same task can never be lost.
  */
 export class ApprovalService {
   constructor(store, commandService) {
@@ -26,7 +29,6 @@ export class ApprovalService {
   }
 
   async createApproval({ taskId, subtaskId = null, itemId = null, question, options = [], proposedAction = null }) {
-    const task = await this.store.loadTask(taskId);
     const approvalId = makeId('AP');
     const approval = {
       schema_version: 1,
@@ -47,17 +49,20 @@ export class ApprovalService {
     };
     await this.store.saveApproval(approval);
 
-    task.pending_approval_ids = task.pending_approval_ids ?? [];
-    if (!task.pending_approval_ids.includes(approvalId)) task.pending_approval_ids.push(approvalId);
-    task.status = 'waiting_owner';
-    await this.store.saveTask(task);
+    const targets = [{ kind: 'task', id: taskId }];
+    if (itemId) targets.push({ kind: 'item', id: itemId });
+    await this.store.mutateGroup(targets, {
+      task: (task) => {
+        task.pending_approval_ids = task.pending_approval_ids ?? [];
+        if (!task.pending_approval_ids.includes(approvalId)) task.pending_approval_ids.push(approvalId);
+        task.status = 'waiting_owner';
+      },
+      item: itemId ? (item) => {
+        item.status = 'waiting_owner';
+        item.approval_id = approvalId;
+      } : undefined
+    });
 
-    if (itemId) {
-      const item = await this.store.loadItem(itemId);
-      item.status = 'waiting_owner';
-      item.approval_id = approvalId;
-      await this.store.saveItem(item);
-    }
     await this.store.logEvent('approval_created', { task_id: taskId, approval_id: approvalId, item_id: itemId });
     return approval;
   }
@@ -72,61 +77,61 @@ export class ApprovalService {
       throw new Error(`Unsupported approval decision: ${decision}`);
     }
 
-    const { record } = await this.store.mutateApproval(approvalId, expectedRevision, (approval) => {
-      if (approval.status !== 'pending') {
-        const error = new Error(`Approval is not pending: ${approvalId}`);
-        error.code = 'INVALID_STATE_TRANSITION';
-        throw error;
-      }
-      switch (decision) {
-        case 'approve':
-          approval.status = 'approved';
-          approval.decision_payload = { decision: 'approve' };
-          break;
-        case 'reject':
-          approval.status = 'rejected';
-          approval.decision_payload = { decision: 'reject' };
-          break;
-        case 'edit':
-          approval.status = 'modified';
-          approval.decision_payload = { decision: 'edit', edited_content: payload.editedContent ?? null };
-          break;
-        case 'select_option':
-          approval.status = 'approved';
-          approval.decision_payload = { decision: 'select_option', option_id: payload.optionId ?? null };
-          break;
-        case 'submit_answer':
-          approval.status = 'approved';
-          approval.decision_payload = { decision: 'submit_answer', answer: payload.answer ?? null };
-          break;
-        default:
-          break;
-      }
-      approval.resolved_at = nowIso();
-      approval.response = decision === 'submit_answer' ? (payload.answer ?? null) : approval.response;
+    // Read-only pre-read for routing; the mutation re-loads under locks.
+    const current = await this.store.loadApproval(approvalId);
+    if (current.status !== 'pending') {
+      const error = new Error(`Approval is not pending: ${approvalId}`);
+      error.code = 'INVALID_STATE_TRANSITION';
+      throw error;
+    }
+
+    const targets = [
+      { kind: 'approval', id: approvalId, expectedRevision },
+      { kind: 'task', id: current.task_id }
+    ];
+    if (current.item_id) targets.push({ kind: 'item', id: current.item_id });
+    const closeItem = decision === 'reject';
+    const loaded = await this.store.mutateGroup(targets, {
+      approval: (approval) => {
+        switch (decision) {
+          case 'approve':
+          case 'select_option':
+          case 'submit_answer':
+            approval.status = 'approved';
+            break;
+          case 'reject':
+            approval.status = 'rejected';
+            break;
+          case 'edit':
+            approval.status = 'modified';
+            break;
+          default:
+            break;
+        }
+        approval.decision_payload = {
+          decision,
+          option_id: payload.optionId ?? null,
+          answer: payload.answer ?? null,
+          edited_content: payload.editedContent ?? null
+        };
+        approval.resolved_at = nowIso();
+        if (decision === 'submit_answer') approval.response = payload.answer ?? null;
+      },
+      task: (task) => {
+        task.pending_approval_ids = (task.pending_approval_ids ?? []).filter((id) => id !== approvalId);
+        if (task.pending_approval_ids.length === 0 && task.status === 'waiting_owner') task.status = 'running';
+        if (closeItem && current.item_id) {
+          task.open_item_ids = (task.open_item_ids ?? []).filter((id) => id !== current.item_id);
+        }
+      },
+      item: current.item_id ? (item) => {
+        if (closeItem) item.status = 'closed';
+        else if (decision === 'edit') item.status = 'modified';
+        else item.status = 'approved';
+      } : undefined
     });
 
-    const approval = record;
-
-    // Keep the parent task consistent inside the same logical step.
-    const task = await this.store.loadTask(approval.task_id);
-    task.pending_approval_ids = (task.pending_approval_ids ?? []).filter((id) => id !== approvalId);
-    if (task.pending_approval_ids.length === 0 && task.status === 'waiting_owner') task.status = 'running';
-    await this.store.saveTask(task);
-
-    if (approval.item_id) {
-      const item = await this.store.loadItem(approval.item_id);
-      if (['rejected', 'modified'].includes(approval.status) && decision === 'reject') {
-        item.status = 'closed';
-        task.open_item_ids = (task.open_item_ids ?? []).filter((id) => id !== item.item_id);
-        await this.store.saveTask(task);
-      } else if (approval.status === 'approved') {
-        item.status = 'approved';
-      } else if (approval.status === 'modified') {
-        item.status = 'modified';
-      }
-      await this.store.saveItem(item);
-    }
+    const approval = loaded.get(`approval:${approvalId}`);
 
     let commandId = null;
     if (decision !== 'reject') {
@@ -135,7 +140,7 @@ export class ApprovalService {
         aggregateType: 'approval',
         aggregateId: approvalId,
         payload: { approval_id: approvalId },
-        requestedBy: task.created_by_employee_number
+        requestedBy: null
       });
       commandId = command.command_id;
     }

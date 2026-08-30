@@ -350,3 +350,100 @@ test('validation errors identify the offending field', async (t) => {
   assert.equal(short.body.error.code, 'VALIDATION_ERROR');
   assert.equal(short.body.error.details.field, 'body.description');
 });
+
+test('idempotency: concurrent duplicate POSTs produce one command, body change conflicts (F-03)', async (t) => {
+  const { post, headers, json, root } = await bootstrap(t);
+  const description = '幂等并发检查的任务描述，长度足够。';
+  const sharedHeaders = { ...headers, 'idempotency-key': 'idem-parallel-001' };
+
+  // Fire two requests with the same key at the same time.
+  const [first, second] = await Promise.all([
+    post('/tasks', { description, priority: 'high' }, sharedHeaders),
+    post('/tasks', { description, priority: 'high' }, sharedHeaders)
+  ]);
+  assert.equal(first.status, 202);
+  assert.equal(second.status, 202, 'the duplicate waits and receives the first result');
+  assert.equal(second.body.task.id, first.body.task.id, 'same task id');
+  assert.equal(second.body.command.id, first.body.command.id, 'same command id');
+
+  // Same key, different body: hard conflict.
+  const conflict = await post('/tasks', { description: '换了内容的不同任务描述，长度足够。' }, sharedHeaders);
+  assert.equal(conflict.status, 409);
+  assert.equal(conflict.body.error.code, 'IDEMPOTENCY_CONFLICT');
+
+  // Same body after completion: clean replay, still one task/command on disk.
+  const replay = await post('/tasks', { description, priority: 'high' }, sharedHeaders);
+  assert.equal(replay.status, 202);
+  assert.equal(replay.body.command.id, first.body.command.id);
+  const store = new Store(root);
+  await store.initialize();
+  assert.equal((await store.listCommands()).filter((command) => command.type === 'task.create').length, 1);
+  const list = await json('/tasks');
+  assert.equal(list.body.total, 1, 'no duplicate task created');
+});
+
+test('idempotency covers reminders and approval decisions (F-03)', async (t) => {
+  const { post, headers, json, root } = await bootstrap(t, async ({ tasks }) => {
+    const task = await tasks.createTask({ request: '催办幂等任务' });
+    const subtask = await tasks.addSubtask(task.task_id, { title: '询问张三', target_employee_number: '00123456', required_information: ['状态'] });
+    await tasks.updateSubtask(task.task_id, subtask.subtask_id, { status: 'waiting_reply' });
+  });
+
+  const detail = await json('/tasks');
+  const task = detail.body.items[0];
+  const subtaskId = (await json(`/tasks/${task.id}`)).body.task.plan[0].id;
+  const remindHeaders = { ...headers, 'idempotency-key': 'idem-remind-parallel' };
+
+  const [first, second] = await Promise.all([
+    post(`/tasks/${task.id}/subtasks/${subtaskId}/reminders`, {}, remindHeaders),
+    post(`/tasks/${task.id}/subtasks/${subtaskId}/reminders`, {}, remindHeaders)
+  ]);
+  assert.equal(first.status, 202);
+  assert.equal(second.status, 202);
+  assert.equal(second.body.command.id, first.body.command.id, 'reminder replayed, not duplicated');
+
+  const store = new Store(root);
+  await store.initialize();
+  const remindCommands = (await store.listCommands()).filter((command) => command.type === 'subtask.remind');
+  assert.equal(remindCommands.length, 1, 'exactly one reminder command persisted');
+});
+
+test('retry on a failed task flows from HTTP to a tick assignment (F-04 e2e)', async (t) => {
+  const { post, headers, json, root } = await bootstrap(t, async ({ tasks }) => {
+    const task = await tasks.createTask({ request: 'HTTP 重试链路任务' });
+    await tasks.changeStatus(task.task_id, 'failed');
+  });
+
+  const failed = (await json('/tasks')).body.items[0];
+  assert.equal(failed.displayStatus, 'failed');
+  const detail = await json(`/tasks/${failed.id}`);
+  assert.ok(detail.body.task.allowedCommands.includes('retry'));
+
+  const retry = await post(`/tasks/${failed.id}/commands`, { type: 'retry', expectedRevision: detail.body.task.revision }, { ...headers, 'idempotency-key': 'idem-retry-e2e' });
+  assert.equal(retry.status, 202);
+  assert.equal(retry.body.command.status, 'queued');
+
+  const { runCli } = await import('./helpers.mjs');
+  const tick = await runCli(root, ['tick']);
+  const assignment = tick.parsed.assignments.find((entry) => entry.command_id === retry.body.command.id);
+  assert.ok(assignment, 'tick delivers the retry assignment');
+  assert.equal(assignment.kind, 'retry_task');
+});
+
+test('server refuses non-loopback host binding (F-07)', async (t) => {
+  const root = await createFixture({ withServer: true });
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+  const { spawn } = await import('node:child_process');
+  const path = await import('node:path');
+
+  for (const host of ['0.0.0.0', '192.168.1.10']) {
+    const child = spawn(process.execPath, [path.join(root, 'server/index.mjs'), '--host', host, '--port', '0'], { cwd: root });
+    const result = await new Promise((resolve) => {
+      let stderr = '';
+      child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+      child.on('close', (code) => resolve({ code, stderr }));
+    });
+    assert.equal(result.code, 1, `host ${host} must be refused`);
+    assert.match(result.stderr, /loopback/, 'error explains the loopback boundary');
+  }
+});

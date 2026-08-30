@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { ensureDir } from './utils.mjs';
@@ -15,20 +16,30 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function newOwnerToken() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
 /**
  * Exclusive inter-process file locks backed by runtime/.locks/.
  *
- * Lock protocol (docs/frontend-backend-integration.md §5.5):
+ * Protocol (docs/frontend-backend-integration.md §5.5):
  * 1. create the lock file with flag "wx" so only one contender wins;
- * 2. persist pid, acquired time and lease deadline inside the lock file;
+ * 2. persist pid, a random owner token, acquired time and lease deadline;
  * 3. callers re-read the latest snapshot after acquiring;
  * 4. callers check expectedRevision before writing;
  * 5. snapshot writes use temp file + rename;
- * 6. release removes the lock file.
+ * 6. release removes the lock file ONLY if the stored owner token still
+ *    matches, so a late release from a crashed-and-taken-over holder can
+ *    never delete the new holder's lock.
  *
- * A lock whose lease expired is considered abandoned by a crashed process
- * and may be taken over. Never hold a lock across long-running external
- * calls (welink-cli): the lease can expire while the work is still running.
+ * Taking over an expired lock means: remove the stale file, then fall
+ * through to the normal "wx" creation race. The winner of that race — not
+ * the process that happened to delete the stale file — owns the lock, so
+ * there is never a window where the critical section runs unprotected.
+ *
+ * Never hold a lock across long-running external calls (welink-cli): the
+ * lease can expire while the work is still running.
  */
 export class LockManager {
   constructor(lockDir) {
@@ -46,16 +57,12 @@ export class LockManager {
     const deadline = Date.now() + acquireTimeoutMs;
 
     for (;;) {
-      const handle = await this.tryCreate(filePath, leaseMs);
-      if (handle) {
-        this.held.set(name, { filePath, leaseMs, leasedAt: Date.now() });
+      const token = newOwnerToken();
+      if (await this.tryCreate(filePath, leaseMs, token)) {
+        this.held.set(name, { filePath, token });
         return name;
       }
-      const stolen = await this.takeOverIfExpired(filePath);
-      if (stolen) {
-        this.held.set(name, { filePath, leaseMs, leasedAt: Date.now() });
-        return name;
-      }
+      await this.takeOverIfExpired(filePath);
       if (Date.now() >= deadline) {
         throw new Error(`Lock acquire timeout: ${name}`);
       }
@@ -63,60 +70,77 @@ export class LockManager {
     }
   }
 
-  async tryCreate(filePath, leaseMs) {
+  async tryCreate(filePath, leaseMs, token) {
+    let handle;
     try {
-      const handle = await fs.open(filePath, 'wx');
-      try {
-        await handle.writeFile(JSON.stringify({
-          pid: process.pid,
-          acquired_at: new Date().toISOString(),
-          lease_until: new Date(Date.now() + leaseMs).toISOString()
-        }), 'utf8');
-      } finally {
-        await handle.close();
-      }
-      return true;
+      handle = await fs.open(filePath, 'wx');
     } catch (error) {
       if (error?.code === 'EEXIST') return false;
       throw error;
     }
+    try {
+      await handle.writeFile(JSON.stringify({
+        pid: process.pid,
+        token,
+        acquired_at: new Date().toISOString(),
+        lease_until: new Date(Date.now() + leaseMs).toISOString()
+      }), 'utf8');
+    } finally {
+      await handle.close();
+    }
+    return true;
   }
 
+  /**
+   * Remove a lock file whose lease has expired. This does NOT grant the
+   * lock — the caller loops back into the "wx" creation race, and whichever
+   * process wins that race becomes the owner.
+   */
   async takeOverIfExpired(filePath) {
     let info;
     try {
-      const text = await fs.readFile(filePath, 'utf8');
-      info = JSON.parse(text);
+      info = JSON.parse(await fs.readFile(filePath, 'utf8'));
     } catch {
-      // The holder may have released between EEXIST and read; retry creation.
-      return false;
+      // The holder may be mid-write (file exists but content not flushed
+      // yet) — never delete a lock we cannot read; retry instead.
+      return;
     }
-    if (info?.pid === process.pid) return false;
+    if (info?.pid === process.pid) {
+      // Never steal a lock owned by this process: a same-process re-entrant
+      // acquire is a bug we want to surface as an acquire timeout, not
+      // silently corrupt.
+      return;
+    }
     const leaseUntil = info?.lease_until ? Date.parse(info.lease_until) : 0;
-    if (Number.isNaN(leaseUntil) || leaseUntil > Date.now() - STALE_HEARTBEAT_GRACE_MS) return false;
+    if (Number.isNaN(leaseUntil) || leaseUntil > Date.now() - STALE_HEARTBEAT_GRACE_MS) return;
     try {
       await fs.rm(filePath, { force: true });
-      return true;
-    } catch {
-      return false;
-    }
+    } catch { /* another contender removed it first */ }
   }
 
+  /** Release only if we still own the lock (owner token matches). */
   async release(name) {
     const entry = this.held.get(name);
     if (!entry) return;
     this.held.delete(name);
+    let info = null;
+    try {
+      info = JSON.parse(await fs.readFile(entry.filePath, 'utf8'));
+    } catch {
+      return; // Already gone or unreadable: nothing to remove.
+    }
+    if (info?.token !== entry.token) return; // A new owner took over.
     try {
       await fs.rm(entry.filePath, { force: true });
-    } catch {
-      // Best effort: an expired takeover may already have removed the file.
-    }
+    } catch { /* ignore */ }
   }
 
   /**
    * Acquire locks in the given key order, run the callback, then release in
    * reverse order. All callers must request the same canonical order to
-   * avoid deadlock: task, approval, item, command (plus slot:* before task).
+   * avoid deadlock: slot:<contactKey> before task, then
+   * task -> approval -> item -> command -> conversation -> action -> state.
+   * State must only ever be the innermost (last-acquired) lock.
    */
   async withLocks(keys, callback, options = {}) {
     const acquired = [];

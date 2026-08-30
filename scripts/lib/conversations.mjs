@@ -58,14 +58,22 @@ export async function listActiveConversations(store, contactKey) {
   return conversations.filter((entry) => entry.contact_key === contactKey && entry.status === 'active');
 }
 
+export async function listConversationsForContact(store, contactKey) {
+  const conversations = await store.listConversations();
+  return conversations.filter((entry) => entry.contact_key === contactKey);
+}
+
 /**
  * Attribution rules in priority order:
- * 1. explicit reply/thread markers match correlation_id or conversation_id;
- * 2. exactly one active conversation for the contact wins;
+ * 1. explicit reply/thread markers match correlation_id or conversation_id
+ *    across ALL conversations of the contact — a closed conversation still
+ *    owns its late replies (delayed-response case, docs §5.2.1);
+ * 2. exactly one ACTIVE conversation for the contact wins;
  * 3. no active conversation -> unattributed (owner/recovery path);
- * 4. multiple candidates -> unresolved_multiple, never guess by time/name.
+ * 4. multiple active candidates -> unresolved_multiple, never guess by
+ *    time or name.
  */
-export function attributeReply({ conversations, replyToActionId = null, externalThreadId = null }) {
+export function attributeReply({ conversations, activeConversations, replyToActionId = null, externalThreadId = null }) {
   if (replyToActionId || externalThreadId) {
     const exact = conversations.find((entry) =>
       (replyToActionId && entry.correlation_id === replyToActionId) ||
@@ -73,12 +81,7 @@ export function attributeReply({ conversations, replyToActionId = null, external
     );
     if (exact) return { status: 'attributed', conversation: exact };
   }
-  if (conversations.length === 1) return { status: 'attributed', conversation: conversations[0] };
-  if (conversations.length === 0) return { status: 'unattributed', conversation: null };
+  if (activeConversations.length === 1) return { status: 'attributed', conversation: activeConversations[0] };
+  if (activeConversations.length === 0) return { status: 'unattributed', conversation: null };
   return { status: 'unresolved_multiple', conversation: null };
-}
-
-export async function markConversationInbound(store, conversation) {
-  conversation.last_inbound_at = nowIso();
-  await store.saveConversation(conversation);
 }

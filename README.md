@@ -137,7 +137,7 @@ $welink-office-agent resume
 
 ## Web 控制台与 Console API
 
-Web 控制台通过本机 Console API（`server/`）读写 runtime，不直接访问文件或 `welink-cli`。API 只监听 `127.0.0.1`，写请求需要 Origin 校验和 CSRF token，外部发送仍走共享 wrapper。
+Web 控制台通过本机 Console API（`server/`）读写 runtime，不直接访问文件或 `welink-cli`。API 强制只监听 loopback（`127.0.0.1`/`localhost`/`::1`，其他地址会在启动时被拒绝），写请求需要 Origin 校验、CSRF token 和 `Idempotency-Key`，外部发送仍走共享 wrapper。
 
 开发模式（两个进程）：
 

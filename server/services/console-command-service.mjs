@@ -17,20 +17,9 @@ export class ConsoleCommandService {
   }
 
   async createTaskFromConsole(input, { idempotencyKey, requestedBy }) {
-    // Idempotent replay: same key + same description returns the first result
-    // without creating a second task or command.
-    if (idempotencyKey) {
-      const existing = await this.commands.findByIdempotencyKey(idempotencyKey);
-      if (existing && existing.type === 'task.create') {
-        const existingTask = await this.store.loadTask(existing.aggregate_id).catch(() => null);
-        if (existingTask && existingTask.original_request === input.description) {
-          return { task: existingTask, command: existing, replayed: true };
-        }
-        if (existingTask) {
-          throw conflictError('IDEMPOTENCY_CONFLICT', '幂等键已用于其他任务。');
-        }
-      }
-    }
+    // Replay/conflict handling lives in the unified IdempotencyService; by
+    // the time we get here the key is fresh. Still pass the key into the
+    // command for traceability.
     // Deadline arrives timezone-aware from the client and is stored as full ISO.
     const task = await this.taskService.createTask({
       request: input.description,
@@ -156,16 +145,24 @@ export class ConsoleCommandService {
       const approval = await this.store.loadApproval(approvalId).catch(() => null);
       if (!approval) continue;
       if (approval.status !== 'pending') continue;
-      const { record } = await this.store.mutateApproval(approvalId, approval.revision, (current) => {
-        current.status = 'modified';
-        current.decision_payload = { decision: 'mark_for_edit' };
-        current.resolved_at = new Date().toISOString();
-      });
-      const task = await this.store.loadTask(record.task_id);
-      task.pending_approval_ids = (task.pending_approval_ids ?? []).filter((id) => id !== approvalId);
-      if (task.pending_approval_ids.length === 0 && task.status === 'waiting_owner') task.status = 'running';
-      await this.store.saveTask(task);
-      await this.store.logEvent('approval_resolved', { task_id: record.task_id, approval_id: approvalId, resolution: 'modified', decision: 'mark_for_edit' });
+      await this.store.mutateGroup(
+        [
+          { kind: 'approval', id: approvalId, expectedRevision: approval.revision },
+          { kind: 'task', id: approval.task_id }
+        ],
+        {
+          approval: (current) => {
+            current.status = 'modified';
+            current.decision_payload = { decision: 'mark_for_edit' };
+            current.resolved_at = new Date().toISOString();
+          },
+          task: (task) => {
+            task.pending_approval_ids = (task.pending_approval_ids ?? []).filter((id) => id !== approvalId);
+            if (task.pending_approval_ids.length === 0 && task.status === 'waiting_owner') task.status = 'running';
+          }
+        }
+      );
+      await this.store.logEvent('approval_resolved', { task_id: approval.task_id, approval_id: approvalId, resolution: 'modified', decision: 'mark_for_edit' });
       changed.push(approvalId);
     }
     return { changed };

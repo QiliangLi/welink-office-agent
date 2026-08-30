@@ -54,6 +54,7 @@ function usage() {
       'query-recent': '[--count 20]',
       tick: '[--max-commands 10] 消费 UI 命令队列并输出待 Agent 推理的分配',
       'complete-command': '--command-id <ID> [--status succeeded|failed] [--error-code <CODE>] [--error-message <文本>]',
+      'ack-command': '--command-id <ID> 宿主 Agent 确认接手 waiting_agent assignment',
       'close-conversation': '--conversation-id <ID> [--reason <原因>] 释放联系人沟通槽并唤醒下一项',
       status: '[--task-id <ID>]',
       resume: '输出所有未完成任务、待确认事项和不确定动作',
@@ -82,10 +83,10 @@ async function runTick() {
   await ensureInitialized();
   const maxCommands = Math.max(1, Number(args['max-commands'] ?? 10) || 10);
 
-  const state = await store.loadState();
-  state.last_started_tick = nowIso();
-  state.status = 'ticking';
-  await store.saveState(state);
+  await store.mutateState((state) => {
+    state.last_started_tick = nowIso();
+    state.status = 'ticking';
+  });
 
   const recoveredLeases = await commands.recoverExpiredLeases();
 
@@ -97,9 +98,11 @@ async function runTick() {
     if (action.status !== 'executing') continue;
     const started = Date.parse(action.created_at);
     if (!Number.isFinite(started) || Date.now() - started <= STALE_EXECUTING_MS) continue;
-    action.status = 'unknown';
-    action.completed_at = nowIso();
-    await store.saveAction(action);
+    await store.mutateAction(action.action_id, (current) => {
+      if (current.status !== 'executing') return; // Another process got there first.
+      current.status = 'unknown';
+      current.completed_at = nowIso();
+    });
     await store.logEvent('action_marked_unknown', { action_id: action.action_id, task_id: action.task_id });
     recoveredActions.push(action.action_id);
   }
@@ -124,12 +127,24 @@ async function runTick() {
       taskId = approval.task_id;
     }
     const task = taskId ? await loadTaskCached(taskId) : null;
-    if (task && ['paused', 'cancelled', 'completed', 'failed'].includes(task.status)) {
-      // Leave queued for after the owner resumes (or cancel removes it).
-      skipCommandIds.add(claimed.command_id);
-      await commands.releaseClaim(claimed.command_id);
-      continue;
+
+    // Re-check aggregate state under the claim: paused/cancelled/completed
+    // tasks hold their commands until the owner resumes or cancels them.
+    // failed tasks may still consume cancel, retry and instructions.
+    if (task) {
+      const executableForStatus = {
+        paused: ['task.cancel'],
+        cancelled: [],
+        completed: [],
+        failed: ['task.cancel', 'task.retry', 'task.instruction']
+      }[task.status];
+      if (executableForStatus && !executableForStatus.includes(claimed.type)) {
+        skipCommandIds.add(claimed.command_id);
+        await commands.releaseClaim(claimed.command_id);
+        continue;
+      }
     }
+    const taskStatusForAssignment = task?.status ?? null;
 
     if (claimed.type === 'task.create') {
       await commands.markWaitingAgent(claimed.command_id);
@@ -137,6 +152,7 @@ async function runTick() {
         kind: 'plan_task',
         command_id: claimed.command_id,
         task_id: claimed.aggregate_id,
+        task_status: taskStatusForAssignment,
         description: task.original_request,
         priority: task.priority
       });
@@ -145,25 +161,25 @@ async function runTick() {
 
     if (claimed.type === 'task.instruction') {
       await commands.markWaitingAgent(claimed.command_id);
-      assignments.push({ kind: 'handle_instruction', command_id: claimed.command_id, task_id: claimed.aggregate_id, text: claimed.payload.text });
+      assignments.push({ kind: 'handle_instruction', command_id: claimed.command_id, task_id: claimed.aggregate_id, task_status: taskStatusForAssignment, text: claimed.payload.text });
       continue;
     }
 
     if (claimed.type === 'task.resume') {
       await commands.markWaitingAgent(claimed.command_id);
-      assignments.push({ kind: 'resume_task', command_id: claimed.command_id, task_id: claimed.aggregate_id });
+      assignments.push({ kind: 'resume_task', command_id: claimed.command_id, task_id: claimed.aggregate_id, task_status: taskStatusForAssignment });
       continue;
     }
 
     if (claimed.type === 'task.cancel') {
       await commands.markWaitingAgent(claimed.command_id);
-      assignments.push({ kind: 'cancel_task', command_id: claimed.command_id, task_id: claimed.aggregate_id });
+      assignments.push({ kind: 'cancel_task', command_id: claimed.command_id, task_id: claimed.aggregate_id, task_status: taskStatusForAssignment });
       continue;
     }
 
     if (claimed.type === 'task.retry') {
       await commands.markWaitingAgent(claimed.command_id);
-      assignments.push({ kind: 'retry_task', command_id: claimed.command_id, task_id: claimed.aggregate_id });
+      assignments.push({ kind: 'retry_task', command_id: claimed.command_id, task_id: claimed.aggregate_id, task_status: taskStatusForAssignment });
       continue;
     }
 
@@ -171,6 +187,13 @@ async function runTick() {
       const approval = await store.loadApproval(claimed.aggregate_id);
       const payload = approval.decision_payload ?? {};
       const proposedAction = approval.proposed_action;
+      // Re-verify at execution time: the task may have been cancelled after
+      // this command was queued.
+      if (task && ['paused', 'cancelled'].includes(task.status)) {
+        skipCommandIds.add(claimed.command_id);
+        await commands.releaseClaim(claimed.command_id);
+        continue;
+      }
       if (approval.status === 'approved' && proposedAction?.type === 'send_message' && !payload.edited_content) {
         let sendOutcome;
         try {
@@ -240,6 +263,7 @@ async function runTick() {
         command_id: claimed.command_id,
         approval_id: approval.approval_id,
         task_id: approval.task_id,
+        task_status: taskStatusForAssignment,
         subtask_id: approval.subtask_id,
         decision_payload: payload,
         proposed_action: proposedAction
@@ -327,10 +351,10 @@ async function runTick() {
     }
   }
 
-  const finalState = await store.loadState();
-  finalState.last_successful_tick = nowIso();
-  finalState.status = 'idle';
-  await store.saveState(finalState);
+  await store.mutateState((state) => {
+    state.last_successful_tick = nowIso();
+    state.status = 'idle';
+  });
 
   return {
     ok: true,
@@ -469,8 +493,8 @@ async function main() {
       const decision = requireArg(args, 'decision');
       const item = await store.loadItem(itemId);
       const task = await store.loadTask(item.parent_task_id);
-      item.decision = decision;
 
+      let linkedSubtaskId = null;
       if (decision === 'auto_subtask') {
         const subtask = await taskService.addSubtask(task.task_id, {
           title: args.title || item.description,
@@ -482,24 +506,35 @@ async function main() {
           created_from_item_id: itemId,
           status: 'ready_to_contact'
         });
-        item.status = 'linked';
-        item.linked_subtask_id = subtask.subtask_id;
-        task.open_item_ids = task.open_item_ids.filter((id) => id !== itemId);
-        await store.saveTask(task);
-      } else if (decision === 'owner_approval') {
-        item.status = 'waiting_owner';
-      } else if (decision === 'independent') {
-        item.status = 'independent_pending';
-      } else if (decision === 'ignore') {
-        item.status = 'closed';
-        task.open_item_ids = task.open_item_ids.filter((id) => id !== itemId);
-        await store.saveTask(task);
-      } else {
-        throw new Error(`Unsupported item decision: ${decision}`);
+        linkedSubtaskId = subtask.subtask_id;
       }
-      await store.saveItem(item);
+
+      const targets = [{ kind: 'item', id: itemId }, { kind: 'task', id: task.task_id }];
+      const updated = await store.mutateGroup(targets, {
+        item: (current) => {
+          current.decision = decision;
+          if (decision === 'auto_subtask') {
+            current.status = 'linked';
+            current.linked_subtask_id = linkedSubtaskId;
+          } else if (decision === 'owner_approval') {
+            current.status = 'waiting_owner';
+          } else if (decision === 'independent') {
+            current.status = 'independent_pending';
+          } else if (decision === 'ignore') {
+            current.status = 'closed';
+          } else {
+            const error = new Error(`Unsupported item decision: ${decision}`);
+            throw error;
+          }
+        },
+        task: (current) => {
+          if (decision === 'auto_subtask' || decision === 'ignore') {
+            current.open_item_ids = (current.open_item_ids ?? []).filter((id) => id !== itemId);
+          }
+        }
+      });
       await store.logEvent('dynamic_item_classified', { task_id: item.parent_task_id, item_id: itemId, decision });
-      jsonOutput({ ok: true, item });
+      jsonOutput({ ok: true, item: updated.get(`item:${itemId}`) });
       return;
     }
 
@@ -526,30 +561,30 @@ async function main() {
       const approvalId = requireArg(args, 'approval-id');
       const resolution = requireArg(args, 'resolution');
       const approval = await store.loadApproval(approvalId);
-      approval.status = resolution;
-      approval.response = args.response ?? null;
-      approval.decision_payload = { decision: resolution, response: args.response ?? null };
-      approval.resolved_at = nowIso();
-      await store.saveApproval(approval);
 
-      const task = await store.loadTask(approval.task_id);
-      task.pending_approval_ids = task.pending_approval_ids.filter((id) => id !== approvalId);
-      if (task.pending_approval_ids.length === 0 && task.status === 'waiting_owner') task.status = 'running';
-      await store.saveTask(task);
-
-      if (approval.item_id) {
-        const item = await store.loadItem(approval.item_id);
-        if (['rejected', 'returned', 'closed'].includes(resolution)) {
-          item.status = 'closed';
-          task.open_item_ids = task.open_item_ids.filter((id) => id !== item.item_id);
-          await store.saveTask(task);
-        } else if (resolution === 'approved') {
-          item.status = 'approved';
-        } else {
-          item.status = 'modified';
-        }
-        await store.saveItem(item);
-      }
+      const targets = [{ kind: 'approval', id: approvalId }, { kind: 'task', id: approval.task_id }];
+      if (approval.item_id) targets.push({ kind: 'item', id: approval.item_id });
+      const closeItem = ['rejected', 'returned', 'closed'].includes(resolution);
+      const loaded = await store.mutateGroup(targets, {
+        approval: (current) => {
+          current.status = resolution;
+          current.response = args.response ?? null;
+          current.decision_payload = { decision: resolution, response: args.response ?? null };
+          current.resolved_at = nowIso();
+        },
+        task: (current) => {
+          current.pending_approval_ids = (current.pending_approval_ids ?? []).filter((id) => id !== approvalId);
+          if (current.pending_approval_ids.length === 0 && current.status === 'waiting_owner') current.status = 'running';
+          if (closeItem && approval.item_id) {
+            current.open_item_ids = (current.open_item_ids ?? []).filter((id) => id !== approval.item_id);
+          }
+        },
+        item: approval.item_id ? (current) => {
+          if (closeItem) current.status = 'closed';
+          else if (resolution === 'approved') current.status = 'approved';
+          else current.status = 'modified';
+        } : undefined
+      });
 
       // Approved/modified decisions still owe the Agent an apply step.
       let commandId = null;
@@ -563,7 +598,7 @@ async function main() {
         commandId = command.command_id;
       }
       await store.logEvent('approval_resolved', { task_id: approval.task_id, approval_id: approvalId, resolution, command_id: commandId });
-      jsonOutput({ ok: true, approval, command_id: commandId });
+      jsonOutput({ ok: true, approval: loaded.get(`approval:${approvalId}`), command_id: commandId });
       return;
     }
 
@@ -611,18 +646,15 @@ async function main() {
       const participantType = requireArg(args, 'participant-type');
       const participantId = requireArg(args, 'participant-id');
       const messageId = requireArg(args, 'message-id');
-      await store.locks.withLocks(['state'], async () => {
-        const state = await store.loadState();
-        const key = `${participantType}:${participantId}`;
+      const key = `${participantType}:${participantId}`;
+      await store.mutateState((state) => {
         state.cursors[key] = {
           last_message_id: messageId,
           last_message_time: args['message-time'] ?? null,
           updated_at: nowIso()
         };
-        await store.saveState(state);
       });
       const state = await store.loadState();
-      const key = `${participantType}:${participantId}`;
       jsonOutput({ ok: true, key, cursor: state.cursors[key] });
       return;
     }
@@ -630,14 +662,14 @@ async function main() {
     case 'update-task': {
       await ensureInitialized();
       const taskId = requireArg(args, 'task-id');
-      const { record } = await store.mutateTask(taskId, undefined, async (task) => {
-        if (args.status) task.status = args.status;
+      const task = await store.mutateTask(taskId, undefined, async (current) => {
+        if (args.status) current.status = args.status;
         if (args['working-summary-file']) {
-          task.working_summary = await readJsonFile(path.resolve(rootDir, args['working-summary-file']));
+          current.working_summary = await readJsonFile(path.resolve(rootDir, args['working-summary-file']));
         }
       });
-      await store.logEvent('task_updated', { task_id: taskId, status: record.status });
-      jsonOutput({ ok: true, task: record });
+      await store.logEvent('task_updated', { task_id: taskId, status: task.status });
+      jsonOutput({ ok: true, task });
       return;
     }
 
@@ -737,6 +769,15 @@ async function main() {
       });
       await store.logEvent('command_updated', { command_id: commandId, status: completed.status });
       jsonOutput({ ok: true, command: completed });
+      return;
+    }
+
+    case 'ack-command': {
+      await ensureInitialized();
+      const commandId = requireArg(args, 'command-id');
+      const acked = await commands.ackCommand(commandId);
+      await store.logEvent('command_acknowledged', { command_id: commandId });
+      jsonOutput({ ok: true, command: acked });
       return;
     }
 

@@ -121,6 +121,11 @@ export async function acquireContactSlot(store, { contactType, contactId, taskId
  * candidate (stable order) is promoted: a fresh conversation is created for
  * it, queue fields are cleared and both slot events are written. Releasing
  * twice is a no-op so crash recovery cannot double-promote.
+ *
+ * Locking: the slot lock is held throughout; the closing conversation is
+ * mutated under its own conversation lock, and the promoted task is mutated
+ * under its own task lock (with a re-check that it still waits for this
+ * slot) so a concurrent Console/Agent edit to that task cannot be lost.
  */
 export async function releaseContactSlot(store, conversation, { reason = 'closed' } = {}) {
   const contactKey = conversation.contact_key;
@@ -130,10 +135,11 @@ export async function releaseContactSlot(store, conversation, { reason = 'closed
     if (current.status !== 'active') {
       return { released: false, promoted: null };
     }
-    current.status = 'closed';
-    current.closed_at = nowIso();
-    current.close_reason = reason;
-    await store.saveConversation(current);
+    await store.mutateConversation(current.conversation_id, (record) => {
+      record.status = 'closed';
+      record.closed_at = nowIso();
+      record.close_reason = reason;
+    });
     await store.logEvent('contact_slot_released', {
       conversation_id: current.conversation_id,
       contact_key: contactKey,
@@ -145,9 +151,12 @@ export async function releaseContactSlot(store, conversation, { reason = 'closed
     const next = candidates[0] ?? null;
     let promoted = null;
     if (next) {
-      const task = await store.loadTask(next.task_id);
-      const subtask = task.subtasks?.find((entry) => entry.subtask_id === next.subtask_id);
-      if (subtask) {
+      promoted = await store.locks.withLocks([`task:${next.task_id}`], async () => {
+        const task = await store.loadTask(next.task_id);
+        const subtask = task.subtasks?.find((entry) => entry.subtask_id === next.subtask_id);
+        // Re-check under the task lock: state may have moved on while we
+        // were closing the previous conversation.
+        if (!subtask || subtask.waiting_kind !== 'contact_slot') return null;
         const nextConversation = await createConversation(store, {
           contactType: contactKey.startsWith('group:') ? 'group' : 'user',
           contactKey,
@@ -163,12 +172,14 @@ export async function releaseContactSlot(store, conversation, { reason = 'closed
         subtask.queue_entered_at = null;
         subtask.conversation_id = nextConversation.conversation_id;
         await store.saveTask(task);
-        promoted = { task_id: next.task_id, subtask_id: next.subtask_id, conversation_id: nextConversation.conversation_id };
+        return { task_id: next.task_id, subtask_id: next.subtask_id, conversation_id: nextConversation.conversation_id };
+      });
+      if (promoted) {
         await store.logEvent('contact_slot_acquired', {
-          conversation_id: nextConversation.conversation_id,
+          conversation_id: promoted.conversation_id,
           contact_key: contactKey,
-          task_id: next.task_id,
-          subtask_id: next.subtask_id
+          task_id: promoted.task_id,
+          subtask_id: promoted.subtask_id
         });
       }
     }

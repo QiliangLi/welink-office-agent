@@ -48,7 +48,7 @@ Do not recreate tasks that already exist.
 Perform exactly one bounded processing cycle. Start from the persisted command inbox, then move to messages:
 
 1. Run `resume`.
-2. Run `tick` (the wrapper command). It deterministically consumes queued console commands: it executes approval sends, reminders and recovery bookkeeping itself, and returns `assignments` — planning/instruction/decision work that needs your reasoning. For each assignment, do the reasoning, record results with `add-subtask`/`send-user`/`update-subtask`, then close the command with `complete-command --command-id <id> --status succeeded` (or `failed` with `--error-code`/`--error-message`).
+2. Run `tick` (the wrapper command). It deterministically consumes queued console commands: it executes approval sends, reminders and recovery bookkeeping itself, and returns `assignments` — planning/instruction/decision work that needs your reasoning. For each assignment, first run `ack-command --command-id <id>` to take ownership (this clears the redelivery lease), re-check the task status in the assignment payload is still valid, then do the reasoning, record results with `add-subtask`/`send-user`/`update-subtask`, and close the command with `complete-command --command-id <id> --status succeeded` (or `failed` with `--error-code`/`--error-message`). Delivered-but-unacked assignments are redelivered after their lease expires; acked assignments are yours — if the task was cancelled meanwhile, complete the command as failed instead of acting.
 3. Read the control group ID and all participants in unfinished tasks.
 4. Query the control group and relevant user/group histories, using saved cursors where available.
 5. Ignore messages containing `[WELINK_AGENT_MESSAGE` as Agent-authored messages.

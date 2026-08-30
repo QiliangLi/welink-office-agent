@@ -1,11 +1,13 @@
 /**
  * SSE fan-out over the JSONL logs (docs §8). Each connection keeps its own
- * byte-offset pair {e, m} into events.jsonl / messages.jsonl, encoded as the
- * SSE id and accepted back via Last-Event-ID, so a reconnecting client
- * resumes exactly where it left off without rewinding anyone else. Only
- * complete newline-terminated records are read; fs.watch triggers a tail
- * and a short interval is the fallback. A client that sends an unusable
- * cursor receives `snapshot.required` and reloads everything.
+ * byte-offset pair {e, m} into events.jsonl / messages.jsonl, encoded as
+ * the SSE id and accepted back via Last-Event-ID, so a reconnecting client
+ * resumes exactly where it left off without rewinding anyone else. Event
+ * ids advance per record (not per batch), so a mid-batch disconnect never
+ * replays or skips notifications. Only complete newline-terminated records
+ * are read; fs.watch triggers a tail and a short interval is the fallback.
+ * A client whose cursor is unusable or points past the current file (log
+ * truncation/rotation) receives `snapshot.required` and reloads everything.
  */
 export class EventStreamService {
   constructor(store, { heartbeatMs = 20_000, pollMs = 1_000 } = {}) {
@@ -71,7 +73,7 @@ export class EventStreamService {
     this.clients.clear();
   }
 
-  addClient(res, lastEventId = null) {
+  async addClient(res, lastEventId = null) {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache, no-transform',
@@ -87,11 +89,22 @@ export class EventStreamService {
       return;
     }
 
-    const client = { res, offsets: decoded ?? { ...this.offsets } };
+    const offsets = decoded ?? { ...this.offsets };
+    // A cursor pointing past the current file means the log was truncated
+    // or rotated: the client must reload instead of resuming.
+    if ((offsets.e > await this.fileSize('events.jsonl')) || (offsets.m > await this.fileSize('messages.jsonl'))) {
+      this.write(res, 'snapshot.required', { reason: 'cursor_invalid' }, this.encodeCursor(this.offsets));
+      res.end();
+      return;
+    }
+
+    const client = { res, offsets };
     this.clients.add(client);
     res.on('close', () => this.clients.delete(client));
     this.write(res, 'hello', { serverTime: new Date().toISOString() }, this.encodeCursor(client.offsets));
-    this.tail().catch(() => {});
+    // Deliver anything recorded since the client's cursor before returning,
+    // so callers that await see a consistent first flush.
+    await this.tailClient(client);
   }
 
   write(res, event, data, id) {
@@ -112,21 +125,23 @@ export class EventStreamService {
 
   async tailClient(client) {
     const eventsLog = await this.store.readJsonl('events.jsonl', { startOffset: client.offsets.e });
-    for (const entry of eventsLog.entries) {
+    eventsLog.entries.forEach((entry, index) => {
+      const cursor = this.encodeCursor({ e: eventsLog.entryOffsets[index], m: client.offsets.m });
       for (const mapped of mapRuntimeEvent(entry)) {
-        this.write(client.res, mapped.event, mapped.data, this.encodeCursor(client.offsets));
+        this.write(client.res, mapped.event, mapped.data, cursor);
       }
-    }
-    client.offsets.e = eventsLog.offset;
+    });
+    if (eventsLog.entries.length > 0) client.offsets.e = eventsLog.offset;
 
     const messagesLog = await this.store.readJsonl('messages.jsonl', { startOffset: client.offsets.m });
-    for (const entry of messagesLog.entries) {
+    messagesLog.entries.forEach((entry, index) => {
+      const cursor = this.encodeCursor({ e: client.offsets.e, m: messagesLog.entryOffsets[index] });
       this.write(client.res, 'message.received', {
         taskId: entry.task_id ?? null,
         direction: entry.direction ?? null
-      }, this.encodeCursor(client.offsets));
-    }
-    client.offsets.m = messagesLog.offset;
+      }, cursor);
+    });
+    if (messagesLog.entries.length > 0) client.offsets.m = messagesLog.offset;
   }
 }
 
@@ -162,6 +177,7 @@ function mapRuntimeEvent(entry) {
     case 'command_updated':
     case 'command_cancelled':
     case 'command_lease_recovered':
+    case 'command_acknowledged':
       return [{ event: 'command.updated', data: { commandId: entry.command_id ?? null, taskId: entry.aggregate_id ?? null } }];
     case 'action_started':
     case 'action_finished':

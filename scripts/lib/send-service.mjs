@@ -25,6 +25,12 @@ export function withAgentFooter(text, policies, metadata) {
  * dry-run handling, agent marker, contact slots and conversation linkage
  * stay in one place (docs §3.1, §5.2.1). The browser never reaches this
  * path directly; the Console API only persists commands.
+ *
+ * Locking: the initial `executing` action record is a fresh file (unique
+ * id, atomic rename) and needs no lock. Every subsequent read-modify-write
+ * — action result, subtask transition, conversation linkage — goes through
+ * the Store's mutate helpers so concurrent Console/Agent processes cannot
+ * overwrite each other.
  */
 export class SendService {
   constructor(store) {
@@ -65,10 +71,11 @@ export class SendService {
 
     const policies = await this.store.loadConfig('policies');
     const result = await runWelink(cliArgs, { dryRun: policies.dry_run === true });
-    action.external_result = result;
-    action.status = result.ok ? (result.dry_run ? 'dry_run' : 'succeeded') : (result.timed_out ? 'unknown' : 'failed');
-    action.completed_at = nowIso();
-    await this.store.saveAction(action);
+    const finalAction = await this.store.mutateAction(actionId, (current) => {
+      current.external_result = result;
+      current.status = result.ok ? (result.dry_run ? 'dry_run' : 'succeeded') : (result.timed_out ? 'unknown' : 'failed');
+      current.completed_at = nowIso();
+    });
 
     await this.store.logMessage({
       direction: 'outbound',
@@ -82,19 +89,19 @@ export class SendService {
       message_type: messageType ?? 'message',
       content,
       action_id: actionId,
-      status: action.status
+      status: finalAction.status
     });
     await this.store.logEvent('action_finished', {
       action_id: actionId,
       task_id: taskId ?? null,
       conversation_id: conversationId ?? null,
-      status: action.status
+      status: finalAction.status
     });
 
     if (taskId && subtaskId && result.ok) {
-      const task = await this.store.loadTask(taskId);
-      const subtask = task.subtasks?.find((entry) => entry.subtask_id === subtaskId);
-      if (subtask) {
+      await this.store.mutateTask(taskId, undefined, (task) => {
+        const subtask = task.subtasks?.find((entry) => entry.subtask_id === subtaskId);
+        if (!subtask) return;
         subtask.status = 'waiting_reply';
         subtask.waiting_kind = null;
         subtask.waiting_reason = null;
@@ -103,11 +110,10 @@ export class SendService {
         subtask.communication.last_contact_at = nowIso();
         subtask.conversation_id = conversationId ?? subtask.conversation_id;
         subtask.next_action = { type: 'wait_reply' };
-        await this.store.saveTask(task);
-      }
+      });
     }
 
-    return { action, result };
+    return { action: finalAction, result };
   }
 
   /**
@@ -163,9 +169,10 @@ export class SendService {
       conversationId: conversation?.conversation_id ?? null
     });
     if (conversation) {
-      conversation.correlation_id = action.action_id;
-      conversation.last_outbound_at = nowIso();
-      await this.store.saveConversation(conversation);
+      await this.store.mutateConversation(conversation.conversation_id, (current) => {
+        current.correlation_id = action.action_id;
+        current.last_outbound_at = nowIso();
+      });
     }
     return { queued: false, action, result };
   }

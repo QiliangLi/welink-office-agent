@@ -4,16 +4,23 @@ import { readJsonBody, assertSameOriginAndCsrf } from './middleware/request-cont
 
 /**
  * Route descriptors registered by the modules in routes/. The router owns
- * request ids, JSON body parsing, the local-first origin/CSRF boundary and
- * the stable error envelope; handlers stay free of HTTP plumbing.
+ * request ids, JSON body parsing, the local-first origin/CSRF boundary,
+ * the unified idempotency layer and the stable error envelope; handlers
+ * stay free of HTTP plumbing.
  */
-
-const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 export function createRouter(context) {
   const routes = [];
   const register = (method, pattern, handler, options = {}) => {
-    routes.push({ method, pattern, keys: patternKeys(pattern), regex: patternRegex(pattern), handler, options });
+    routes.push({
+      id: `${method} ${pattern}`,
+      method,
+      pattern,
+      keys: patternKeys(pattern),
+      regex: patternRegex(pattern),
+      handler,
+      options
+    });
   };
 
   const registerAll = (module) => module.register(register, context);
@@ -48,18 +55,46 @@ export function createRouter(context) {
           body = await readJsonBody(req);
           if (matched.options.schema) validate(matched.options.schema, body, 'body');
           if (!matched.options.skipCsrf) assertSameOriginAndCsrf(req, context);
-          if (!matched.options.skipIdempotency && !IDEMPOTENT_METHODS.has(req.method)) {
-            const key = req.headers['idempotency-key'];
-            if (typeof key !== 'string' || key.length < 8) {
-              const error = toApiError(Object.assign(new Error('缺少 Idempotency-Key 请求头。'), { status: 400, code: 'VALIDATION_ERROR' }));
-              throw error;
-            }
-            body.__idempotencyKey = key;
-          }
         }
 
-        const reply = (status, data) => sendJson(res, status, data, requestId);
-        await matched.handler({ req, res, params, query, repeat, body, requestId, reply, context });
+        // Unified persistent idempotency: same key + same target/body
+        // replays the first response; same key with different input is a
+        // 409. The placeholder prevents concurrent duplicate execution.
+        let idempotencyKey = null;
+        if (req.method === 'POST' && !matched.options.skipIdempotency) {
+          const clientKey = req.headers['idempotency-key'];
+          if (typeof clientKey !== 'string' || clientKey.length < 8) {
+            throw toApiError(Object.assign(new Error('缺少 Idempotency-Key 请求头。'), { status: 400, code: 'VALIDATION_ERROR' }));
+          }
+          const { replay, key } = await context.idempotencyService.begin({
+            route: matched.id,
+            key: clientKey,
+            pathname,
+            body
+          });
+          if (replay) {
+            sendJson(res, replay.statusCode, replay.response, requestId);
+            return;
+          }
+          idempotencyKey = key;
+        }
+
+        // Capture the response so the idempotency record can store it.
+        let captured = null;
+        const reply = (status, data) => {
+          captured = { status, data };
+          sendJson(res, status, data, requestId);
+        };
+
+        try {
+          await matched.handler({ req, res, params, query, repeat, body, requestId, reply, context });
+          if (idempotencyKey && captured) {
+            await context.idempotencyService.complete(idempotencyKey, captured.status, captured.data ?? null);
+          }
+        } catch (handlerError) {
+          if (idempotencyKey) await context.idempotencyService.fail(idempotencyKey);
+          throw handlerError;
+        }
       } catch (error) {
         const apiError = toApiError(error);
         if (apiError.status >= 500) {

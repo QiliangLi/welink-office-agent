@@ -2,14 +2,16 @@ import {
   attributeReply,
   contactKeyFor,
   listActiveConversations,
-  markConversationInbound
+  listConversationsForContact
 } from './conversations.mjs';
 
 /**
- * Every inbound message is persisted BEFORE the Agent reasons about it, and
- * reply attribution runs before any task progress may be derived from it
- * (docs §9.6). Ambiguous replies stay unattributed — they never advance a
- * task just because the contact name and timestamp look plausible.
+ * Every inbound message is persisted BEFORE any state is mutated because of
+ * it, and reply attribution runs before any task progress may be derived
+ * from it (docs §9.6). The attribution decision itself is computed from
+ * read-only snapshots; the message log entry is the first write. Ambiguous
+ * replies stay unattributed — they never advance a task just because the
+ * contact name and timestamp look plausible.
  */
 export class MessageService {
   constructor(store) {
@@ -18,14 +20,18 @@ export class MessageService {
 
   async recordInbound({ participantType, participantId, content, externalMessageId = null, replyToActionId = null, externalThreadId = null, taskId = null, subtaskId = null }) {
     const contactKey = contactKeyFor(participantType, participantId);
-    const candidates = await listActiveConversations(this.store, contactKey);
-    const attribution = attributeReply({ conversations: candidates, replyToActionId, externalThreadId });
+    const allConversations = await listConversationsForContact(this.store, contactKey);
+    const activeConversations = allConversations.filter((entry) => entry.status === 'active');
+    const attribution = attributeReply({
+      conversations: allConversations,
+      activeConversations,
+      replyToActionId,
+      externalThreadId
+    });
 
     const attributed = attribution.status === 'attributed' ? attribution.conversation : null;
-    if (attributed) {
-      await markConversationInbound(this.store, attributed);
-    }
 
+    // First write: the raw message, with whatever attribution we resolved.
     const entry = await this.store.logMessage({
       direction: 'inbound',
       participant_type: participantType,
@@ -41,6 +47,13 @@ export class MessageService {
       attribution_status: attribution.status,
       status: 'recorded'
     });
+
+    // Only after the message is durable do we touch related state.
+    if (attributed) {
+      await this.store.mutateConversation(attributed.conversation_id, (conversation) => {
+        conversation.last_inbound_at = entry.timestamp;
+      });
+    }
 
     await this.store.logEvent(attribution.status === 'attributed' ? 'message_attributed' : 'message_unattributed', {
       log_id: entry.log_id,

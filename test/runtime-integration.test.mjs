@@ -281,3 +281,195 @@ test('paused tasks keep their queued commands untouched by tick', async (t) => {
   const pending = (await store.listCommands()).find((entry) => entry.type === 'task.create');
   assert.equal(pending.status, 'queued', 'command stays queued for resume');
 });
+
+test('concurrent task creation never loses active_task_ids (F-02 regression)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+
+  await Promise.all(Array.from({ length: 6 }, (_, index) => tasks.createTask({ request: `并发任务 ${index}` })));
+  const state = await store.loadState();
+  assert.equal(state.active_task_ids.length, 6, 'every concurrent create registered its task id');
+  assert.deepEqual([...state.active_task_ids].sort().length, new Set(state.active_task_ids).size);
+});
+
+test('approval decision and concurrent subtask update do not overwrite each other (F-02 regression)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+  const approvals = new ApprovalService(store, commands);
+
+  const task = await tasks.createTask({ request: '并发审批任务' });
+  const subtask = await tasks.addSubtask(task.task_id, { title: '询问进展', target_employee_number: '00123456' });
+  const approval = await approvals.createApproval({ taskId: task.task_id, question: '是否继续？' });
+
+  // Console decision and an Agent-side subtask update race on the same task.
+  await Promise.all([
+    approvals.recordDecision({ approvalId: approval.approval_id, decision: 'approve', expectedRevision: approval.revision }),
+    tasks.updateSubtask(task.task_id, subtask.subtask_id, { status: 'completed', summary: '已收集' })
+  ]);
+
+  const finalTask = await store.loadTask(task.task_id);
+  assert.equal(finalTask.subtasks[0].status, 'completed', 'agent subtask update survived');
+  assert.equal(finalTask.pending_approval_ids.length, 0, 'decision cleared the pending list');
+  assert.equal(finalTask.status, 'running', 'task left waiting_owner');
+});
+
+test('delayed reply to a closed conversation is not attributed to the next task (F-05 regression)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+  const sends = new SendService(store);
+  const messages = new MessageService(store);
+  const { releaseContactSlot } = await import('../scripts/lib/contact-slots.mjs');
+
+  const taskA = await tasks.createTask({ request: '任务A' });
+  const subA = await tasks.addSubtask(taskA.task_id, { title: 'A 询问王璐', target_employee_number: '00123456' });
+  const sendA = await sends.sendUser({ employeeNumber: '00123456', text: 'A 的问题', taskId: taskA.task_id, subtaskId: subA.subtask_id });
+  const conversationA = await store.loadConversation(sendA.action.conversation_id);
+
+  // A's conversation closes (timeout/reply processed), B acquires the slot.
+  await releaseContactSlot(store, conversationA, { reason: 'closed' });
+  const taskB = await tasks.createTask({ request: '任务B' });
+  const subB = await tasks.addSubtask(taskB.task_id, { title: 'B 询问王璐', target_employee_number: '00123456' });
+  const sendB = await sends.sendUser({ employeeNumber: '00123456', text: 'B 的问题', taskId: taskB.task_id, subtaskId: subB.subtask_id });
+  assert.equal(sendB.queued, false, 'B holds the slot now');
+
+  // The contact finally answers A's old message, carrying A's correlation id.
+  const late = await messages.recordInbound({
+    participantType: 'user',
+    participantId: '00123456',
+    content: 'A 的问题答复：已完成',
+    replyToActionId: sendA.action.action_id
+  });
+  assert.equal(late.attribution.status, 'attributed');
+  assert.equal(late.attribution.conversation.conversation_id, conversationA.conversation_id, 'explicit id wins across closed conversations');
+  assert.equal(late.message.task_id, taskA.task_id, 'reply landed on task A, not B');
+  assert.equal(late.message.subtask_id, subA.subtask_id);
+  assert.equal(late.message.attribution_status, 'attributed');
+
+  // The raw message was persisted with its attribution in one record.
+  const logs = await store.readJsonlAll('messages.jsonl');
+  const recorded = logs.find((entry) => entry.log_id === late.message.log_id);
+  assert.equal(recorded.task_id, taskA.task_id);
+});
+
+test('message log entry is written before conversation mutation (F-05 ordering)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+  const sends = new SendService(store);
+  const messages = new MessageService(store);
+
+  const task = await tasks.createTask({ request: '落盘顺序' });
+  const sub = await tasks.addSubtask(task.task_id, { title: '询问', target_employee_number: '00123456' });
+  const send = await sends.sendUser({ employeeNumber: '00123456', text: '在吗', taskId: task.task_id, subtaskId: sub.subtask_id });
+  const beforeInbound = await store.loadConversation(send.action.conversation_id);
+  const originalInboundAt = beforeInbound.last_inbound_at;
+
+  const { message } = await messages.recordInbound({ participantType: 'user', participantId: '00123456', content: '在的' });
+  const logs = await store.readJsonlAll('messages.jsonl');
+  assert.ok(logs.some((entry) => entry.log_id === message.log_id), 'raw message persisted');
+  const after = await store.loadConversation(send.action.conversation_id);
+  assert.notEqual(after.last_inbound_at, originalInboundAt, 'conversation updated only after the message record exists');
+});
+
+test('waiting_agent assignments: ack keeps ownership, lease expiry redelivers, cancel revokes (F-06)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+
+  const task = await tasks.createTask({ request: 'assignment 协议' });
+  const { command } = await commands.create({ type: 'task.create', aggregateType: 'task', aggregateId: task.task_id });
+
+  const claimed = await commands.claimNext({ workerId: 'w1' });
+  await commands.markWaitingAgent(claimed.command_id, { leaseMs: 60_000 });
+  let current = await store.loadCommand(command.command_id);
+  assert.equal(current.status, 'waiting_agent');
+  assert.equal(current.assignment_state, 'delivered');
+  assert.ok(current.lease_until, 'delivered assignment keeps its lease');
+
+  // Host acks: lease cleared, no longer recoverable or cancellable.
+  await commands.ackCommand(command.command_id);
+  current = await store.loadCommand(command.command_id);
+  assert.equal(current.assignment_state, 'acked');
+  assert.equal(current.lease_until, null);
+  assert.deepEqual(await commands.recoverExpiredLeases(), []);
+
+  // Acked assignments survive task cancellation (host re-checks task state).
+  await tasks.cancel(task.task_id);
+  current = await store.loadCommand(command.command_id);
+  assert.equal(current.status, 'waiting_agent', 'acked assignment is not cancelled');
+
+  // Unacked assignments ARE cancelled by task cancellation.
+  const task2 = await tasks.createTask({ request: '取消撤销' });
+  const { command: cmd2 } = await commands.create({ type: 'task.create', aggregateType: 'task', aggregateId: task2.task_id });
+  await commands.claimNext({ workerId: 'w1' });
+  await commands.markWaitingAgent(cmd2.command_id, { leaseMs: 60_000 });
+  await tasks.cancel(task2.task_id);
+  const cancelledCmd = await store.loadCommand(cmd2.command_id);
+  assert.equal(cancelledCmd.status, 'cancelled', 'delivered-but-unacked assignment is revoked');
+
+  // Complete refuses to resurrect a cancelled command.
+  await commands.complete(cmd2.command_id, { status: 'succeeded' });
+  assert.equal((await store.loadCommand(cmd2.command_id)).status, 'cancelled');
+
+  // Delivered-but-unacked assignment with expired lease is redelivered.
+  const task3 = await tasks.createTask({ request: '重投递' });
+  const { command: cmd3 } = await commands.create({ type: 'task.create', aggregateType: 'task', aggregateId: task3.task_id });
+  await commands.claimNext({ workerId: 'w1' });
+  await commands.markWaitingAgent(cmd3.command_id, { leaseMs: 60_000 });
+  const stale = await store.loadCommand(cmd3.command_id);
+  stale.lease_until = new Date(Date.now() - 60_000).toISOString();
+  await store.saveCommand(stale);
+  const recovered = await commands.recoverExpiredLeases();
+  assert.deepEqual(recovered, [cmd3.command_id], 'unacked assignment requeued after lease expiry');
+  assert.equal((await store.loadCommand(cmd3.command_id)).status, 'queued');
+});
+
+test('failed task retry reaches tick as a retry_task assignment (F-04 e2e)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+
+  const task = await tasks.createTask({ request: '失败重试任务', source: 'web_console' });
+  await tasks.changeStatus(task.task_id, 'failed');
+
+  const { runCli } = await import('./helpers.mjs');
+  // CLI path first: create the retry command the way the console would.
+  const { command } = await commands.create({ type: 'task.retry', aggregateType: task.task_id && 'task', aggregateId: task.task_id });
+  const tick = await runCli(root, ['tick']);
+  assert.equal(tick.code, 0);
+  const assignment = tick.parsed.assignments.find((entry) => entry.command_id === command.command_id);
+  assert.ok(assignment, 'tick delivered the retry assignment');
+  assert.equal(assignment.kind, 'retry_task');
+  assert.equal(assignment.task_status, 'failed');
+
+  // Host completes the assignment.
+  const done = await runCli(root, ['complete-command', '--command-id', command.command_id, '--status', 'succeeded']);
+  assert.equal(done.parsed.command.status, 'succeeded');
+});

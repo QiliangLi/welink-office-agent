@@ -32,12 +32,13 @@ node scripts/agent.mjs complete-task --task-id TASK-ID --summary "最终汇总"
 
 ```bash
 node scripts/agent.mjs tick [--max-commands 10]
+node scripts/agent.mjs ack-command --command-id CMD-ID
 node scripts/agent.mjs complete-command --command-id CMD-ID --status succeeded
 node scripts/agent.mjs complete-command --command-id CMD-ID --status failed --error-code AGENT_ERROR --error-message "原因"
 node scripts/agent.mjs close-conversation --conversation-id CONV-ID [--reason replied]
 ```
 
-`tick` 输出 `assignments`（需要宿主 Agent 推理的工作，含 `command_id`）、`executed`（确定性命令结果）、`due_followups`（到期追问）与 `uncertain_actions`。处理完一条 assignment 后必须用 `complete-command` 回写。子任务完成或会话结束时用 `close-conversation` 释放联系人沟通槽。
+`tick` 输出 `assignments`（需要宿主 Agent 推理的工作，含 `command_id` 与 `task_status`）、`executed`（确定性命令结果）、`due_followups`（到期追问）与 `uncertain_actions`。接手一条 assignment 前先 `ack-command` 清除重投租约，并核对 `task_status`（任务可能已被取消）；完成后用 `complete-command` 回写。已 ack 的 assignment 不受任务取消撤销，也不会被重新投递；未 ack 的在租约到期后回到队列重投。子任务完成或会话结束时用 `close-conversation` 释放联系人沟通槽。
 
 ## Dynamic item and approval
 
