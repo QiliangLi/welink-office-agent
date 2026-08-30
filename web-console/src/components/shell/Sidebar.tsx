@@ -35,7 +35,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
         </nav>
         <div className="sidebar-helper">
           <div className="helper-note">Hi，今天也交给我。我会把阻塞和风险及时告诉你。</div>
-          <AgentMascot mood="working" size="lg" />
+          <AgentMascot mood="working" scene="idle" size="lg" />
         </div>
       </aside>
     </>

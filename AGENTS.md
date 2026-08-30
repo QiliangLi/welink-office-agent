@@ -42,7 +42,7 @@
 - Use a cool lilac/slate substrate with a restrained flat violet accent. Do not use neon purple glow, gradient text, glassmorphism, pure `#fff`/`#000`, or hard grey card borders.
 - Lock the radius scale, spacing scale, icon sizes, button variants, shadows, and status colors in shared tokens.
 - Motion is feedback-only: page transitions, hover/focus feedback, progress updates, and one running-state pulse. Support `prefers-reduced-motion`.
-- Robot imagery is a visual asset, not a complex UI component. Until approved transparent mascot assets exist, use one consistent lightweight mascot treatment; do not redraw each screenshot robot independently.
+- Use the vendored upstream GrokBot implementation for every Agent illustration. The SVG body, all 25 original expression coordinate sets, gaze/blink/morph loop, state motion, and six jelly quick actions come directly from `zhulin025/LaoA-GrokBot`; do not redraw, simplify, recolor, or add decorative parts. Product code may only adapt the React lifecycle, accessible label, sizing, and business-scene-to-upstream-state mapping. Each placement must use a semantically named scene with a restrained action whitelist; never rotate every action through every placement. Keep attribution and the MIT notice in `web-console/THIRD_PARTY_NOTICES.md`.
 - Use semantic status colors consistently. Never communicate status by color alone; pair color with text and/or an icon.
 
 ## Product behavior

@@ -57,7 +57,7 @@ export function NewTaskPage() {
 
   return (
     <div className="page new-task-page">
-      <div className="new-task-heading"><div><Link to="/tasks" className="back-link"><ArrowLeft />返回任务</Link><h1>创建新任务 <Sparkles /></h1><p>告诉 Agent 你需要完成的工作，它会规划步骤、推进执行并在关键节点请你确认。</p></div><div className="heading-mascot"><AgentMascot mood="working" size="lg" /><span className="floating-check"><Check /></span></div></div>
+      <div className="new-task-heading"><div><Link to="/tasks" className="back-link"><ArrowLeft />返回任务</Link><h1>创建新任务 <Sparkles /></h1><p>告诉 Agent 你需要完成的工作，它会规划步骤、推进执行并在关键节点请你确认。</p></div><div className="heading-mascot"><AgentMascot mood="working" scene="create" size="lg" /><span className="floating-check"><Check /></span></div></div>
       <div className="new-task-layout">
         <form className="task-form" onSubmit={(event) => { event.preventDefault(); if (!descriptionError) setConfirmOpen(true); }}>
           <section className="form-card prompt-card">
@@ -84,7 +84,7 @@ export function NewTaskPage() {
           <div className="form-action-bar"><span><Lock />创建后，Agent 将立即拆解任务并开始执行</span><div><button type="button" className="button button-secondary" onClick={saveDraft}><Save />保存草稿</button><button className="button button-primary" disabled={Boolean(descriptionError)}>创建任务 <ArrowRight /></button></div>{savedAt && <small>草稿已保存 · {savedAt}</small>}</div>
         </form>
 
-        <aside className="inspiration-panel"><div className="inspiration-mascot"><span><Lightbulb /></span><AgentMascot mood="approval" size="lg" /></div><p>需要灵感？</p><h2>试试这样描述任务</h2><div className="inspiration-list">{examples.map((example) => <button key={example} onClick={() => update("description", example)}><Sparkles />{example}</button>)}</div><button className="shuffle-button" onClick={() => update("description", examples[Math.floor(Math.random() * examples.length)])}>换一换</button></aside>
+        <aside className="inspiration-panel"><div className="inspiration-mascot"><span><Lightbulb /></span><AgentMascot mood="working" scene="inspiration" size="lg" /></div><p>需要灵感？</p><h2>试试这样描述任务</h2><div className="inspiration-list">{examples.map((example) => <button key={example} onClick={() => update("description", example)}><Sparkles />{example}</button>)}</div><button className="shuffle-button" onClick={() => update("description", examples[Math.floor(Math.random() * examples.length)])}>换一换</button></aside>
       </div>
       <ConfirmDialog open={confirmOpen} title="确认创建并开始执行？" description="Agent 会立即拆解任务并开始推进。涉及对外发送、费用或不可撤回动作时仍会等待你的确认。" confirmLabel="创建并开始" onConfirm={submit} onClose={() => setConfirmOpen(false)} />
     </div>

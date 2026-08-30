@@ -4,6 +4,7 @@ import { StatusBadge } from "./StatusBadge";
 
 describe("StatusBadge", () => {
   it.each([
+    ["queued", "待执行"],
     ["running", "执行中"],
     ["waiting_external", "等待外部"],
     ["waiting_approval", "待我处理"],

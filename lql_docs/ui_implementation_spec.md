@@ -38,6 +38,8 @@
 
 前端作为独立工程放在 `web-console/`，避免污染根目录现有 Node Skill 的依赖与脚本。
 
+Agent 形象统一由 `components/mascot/AgentMascot.tsx` 接入 `zhulin025/LaoA-GrokBot` 原版实现。机器人轮廓、25 套表情坐标、视线跟随、眨眼、表情弹性变形、状态动作和 6 种果冻快捷动作均直接使用上游代码与数据，不进行重新绘制或视觉改编；本项目只负责 React 生命周期、尺寸、无障碍名称，以及业务场景到上游状态池的映射。第三方版权与 MIT License 记录在 `web-console/THIRD_PARTY_NOTICES.md`。
+
 ```text
 web-console/
 ├── public/
@@ -247,9 +249,11 @@ Task Detail 的计划树必须由该结构递归渲染，不得在 JSX 中硬编
 
 ### 6.5 Mascot
 
-第一版不生成新图片。实现统一的 `AgentMascot` 轻量组件，用圆角外壳、面屏、天线和状态表情表达角色，并支持 `working`、`waiting`、`approval`、`success`、`empty` 五种状态。
+`AgentMascot` 直接渲染原版 GrokBot SVG，并保留 `working`、`waiting`、`approval`、`success`、`empty` 五种业务 mood。具体出现位置再通过 `scene` 区分 `idle`、`monitoring`、`waiting`、`filtering`、`create`、`inspiration`、`approval`、`success`、`empty`、`blocked`，避免同一种笼统情绪覆盖不同业务含义。
 
-该组件只承担装饰和空状态，不传递唯一信息。所有图片等价信息必须出现在文字中。未来若提供统一透明 PNG，可保持 props 不变，内部切换到 `<img>`。
+每个 scene 组合多个原版状态池，扩大表情覆盖；动作则使用小而明确的白名单。例如监控使用扫描/观察，创建使用思考/挤压，审批使用招手/提醒，完成使用弹跳/挥手，空状态只保留低频呼吸。机器人挂载后先静止，动作按 6.5 至 12 秒的场景节奏低频触发，不同实例以稳定偏移错开。禁止把全部动作无差别轮播到每个位置。
+
+该组件只承担装饰和状态强化，不传递唯一信息。所有图片等价信息必须出现在文字中；`prefers-reduced-motion` 下停止自动表情和位移动画。
 
 ## 7. App Shell
 
@@ -528,4 +532,4 @@ npm run build
 - 320px 到桌面无横向页面滚动。
 - 键盘焦点可见，表单和 Dialog 具备基本无障碍语义。
 - lint、test、build 全部通过。
-- 已完成渲染后的逐页视觉检查，并记录仍需真实 mascot 资产替换的差异。
+- 已完成渲染后的逐页视觉检查，所有 Agent 场景均使用统一的 GrokBot SVG 组件。

@@ -4,7 +4,7 @@ export const STATUS_META: Record<
   TaskStatus,
   { label: string; shortLabel: string; tone: "neutral" | "primary" | "success" | "warning" | "danger" | "info" }
 > = {
-  queued: { label: "排队中", shortLabel: "排队", tone: "neutral" },
+  queued: { label: "待执行", shortLabel: "待执行", tone: "neutral" },
   running: { label: "执行中", shortLabel: "执行中", tone: "success" },
   waiting_external: { label: "等待外部", shortLabel: "等外部", tone: "warning" },
   waiting_approval: { label: "待我处理", shortLabel: "待处理", tone: "primary" },
