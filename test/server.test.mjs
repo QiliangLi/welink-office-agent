@@ -515,3 +515,53 @@ test('HTTP layer surfaces the idempotency key to handlers and returns fresh revi
   const command = (await store.listCommands()).find((entry) => entry.type === 'task.create');
   assert.equal(command.idempotency_key, 'idem-rev-check-1');
 });
+
+test('idempotency: immediate replay during the running window waits for completion (T-01)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+  const { IdempotencyService } = await import('../server/services/idempotency-service.mjs');
+  const store = new Store(root);
+  await store.initialize();
+
+  const server1 = new IdempotencyService(store, { owner: '00000000' });
+  const server2 = new IdempotencyService(store, { owner: '00000000' });
+  const args = { route: 'POST /api/v1/tasks', key: 'immediate-replay-1', pathname: '/api/v1/tasks', body: { description: '即时重放时序检查的任务描述' } };
+
+  const first = await server1.begin(args);
+  await server1.markRunning(first.key, first.attemptId);
+
+  // The client saw the (not yet persisted) response and replays immediately:
+  // the second begin must WAIT for the live running record, not report an
+  // unknown outcome.
+  let replayOutcome = null;
+  const replayPromise = server2.begin(args).then(
+    (result) => { replayOutcome = result; return result; },
+    (error) => { replayOutcome = error; throw error; },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(replayOutcome, null, 'replay is still waiting while the first request is live');
+
+  // The first request finishes: record completed BEFORE the client could
+  // act on the response (app.mjs sends the reply after complete()).
+  await server1.complete(first.key, 202, { task: { id: 'TASK-REPLAY' }, command: { id: 'CMD-1' } });
+  const replay = await replayPromise;
+  assert.ok(replay.replay, 'waiting replay resolves to the first result');
+  assert.deepEqual(replay.replay.response, { task: { id: 'TASK-REPLAY' }, command: { id: 'CMD-1' } });
+});
+
+test('HTTP create + immediate replay is stable across repeated rounds (T-01 regression)', async (t) => {
+  const { post, headers } = await bootstrap(t);
+  for (let round = 0; round < 5; round += 1) {
+    const shared = { ...headers, 'idempotency-key': `idem-t01-round-${round}` };
+    const description = `即时重放稳定性检查 第 ${round} 轮任务描述`;
+    const first = await post('/tasks', { description }, shared);
+    assert.equal(first.status, 202);
+    // Fire the replay before anything else can run: complete() already
+    // happened before the first response was sent, so this must never
+    // produce unknown_outcome.
+    const replay = await post('/tasks', { description }, shared);
+    assert.equal(replay.status, 202, `round ${round}: replay is not misjudged`);
+    assert.equal(replay.body.task.id, first.body.task.id, `round ${round}: same task`);
+    assert.equal(replay.body.command.id, first.body.command.id, `round ${round}: same command`);
+  }
+});

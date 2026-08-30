@@ -215,7 +215,8 @@ async function runTick() {
                 taskId: approval.task_id,
                 subtaskId: approval.subtask_id,
                 approvalId: approval.approval_id,
-                type: 'approval'
+                type: 'approval',
+                rejectFinishedTask: true
               })) }
             : { queued: false, ...(await sendService.sendUser({
                 employeeNumber: proposedAction.target_id,
@@ -606,6 +607,7 @@ async function main() {
           type: 'approval.apply',
           aggregateType: 'approval',
           aggregateId: approvalId,
+          parentTaskId: approval.task_id,
           payload: { approval_id: approvalId, source: 'skill' }
         });
         commandId = command.command_id;

@@ -21,9 +21,7 @@ const DEFAULT_LEASE_MS = 5 * 60_000;
  * Agent tick claims commands and either executes deterministic parts
  * directly or hands reasoning work back to the host Agent loop.
  *
- * State machine (transitions are monotonic — every writer re-checks the
- * current status inside the record lock, so a cancellation always wins and
- * no writer can resurrect a cancelled command):
+ * State machine (transitions are monotonic):
  *
  *   queued -> claimed -> succeeded|failed|cancelled
  *                     \-> waiting_agent(delivered) -> acked -> executing
@@ -37,15 +35,18 @@ const DEFAULT_LEASE_MS = 5 * 60_000;
  * - `executing`: the host announced real work via begin-command. Cancellation
  *   no longer revokes it; the host re-checks the persisted task status and
  *   reports the outcome with complete-command.
- * - Task cancellation revokes queued/claimed/delivered/acked commands;
- *   executing ones stay with the host. `complete`/`failed` on a cancelled
- *   command is a no-op.
+ * - Task cancellation revokes queued/claimed/delivered/acked commands whose
+ *   parent task matches; executing ones stay with the host. `complete`/
+ *   `failed` on a cancelled command is a no-op.
  *
- * Locking: scanning paths (claim/cancel/recover) hold the `commands`
- * collection lock; single-command writers hold the `command:<id>` record
- * lock and validate the transition there. Cancel takes both (collection
- * first, then each record), so it cannot interleave with a record-lock
- * writer mid-transition.
+ * Lock protocol: EVERY transition re-reads the record and validates the
+ * transition while holding the `command:<id>` record lock. Scanning paths
+ * (claim/recover/cancel) hold the `commands` collection lock first and then
+ * take each record's lock one by one (collection before record, never the
+ * reverse), so a racing single-record writer — ack, begin, complete — can
+ * never be overwritten by a stale snapshot. Cancellation additionally
+ * matches on the stable `parent_task_id`, which covers commands whose
+ * aggregate is an approval/item rather than the task itself.
  */
 export class CommandService {
   constructor(store) {
@@ -60,7 +61,7 @@ export class CommandService {
     });
   }
 
-  async create({ type, aggregateType, aggregateId, payload = {}, idempotencyKey = null, requestedBy = null }) {
+  async create({ type, aggregateType, aggregateId, payload = {}, idempotencyKey = null, requestedBy = null, parentTaskId = null }) {
     if (!COMMAND_TYPES.includes(type)) throw new Error(`Unsupported command type: ${type}`);
     return this.store.locks.withLocks(['commands'], async () => {
       const commands = await this.store.listCommands();
@@ -85,6 +86,7 @@ export class CommandService {
         type,
         aggregate_type: aggregateType,
         aggregate_id: aggregateId,
+        parent_task_id: parentTaskId,
         idempotency_key: idempotencyKey,
         requested_by_employee_number: requestedBy,
         payload,
@@ -103,18 +105,17 @@ export class CommandService {
         command_id: command.command_id,
         command_type: type,
         aggregate_type: aggregateType,
-        aggregate_id: aggregateId
+        aggregate_id: aggregateId,
+        parent_task_id: parentTaskId
       });
       return { command, replayed: false };
     });
   }
 
   /**
-   * Claim the next queued command matching the filters, under one lock so
-   * concurrent ticks never claim the same command. Claimed commands carry a
-   * lease; expired leases are recovered to queued before scanning.
-   * `skipCommandIds` lets a tick leave specific commands queued (e.g. the
-   * aggregate task is paused) without spinning on the same entry.
+   * Claim the next queued command matching the filters. The candidate is
+   * re-read and re-validated under its record lock before the write, so a
+   * concurrent single-record writer always wins or loses atomically.
    */
   async claimNext({ types = null, aggregateTypes = null, workerId, leaseMs = DEFAULT_LEASE_MS, skipCommandIds = [] } = {}) {
     return this.store.locks.withLocks(['commands'], async () => {
@@ -127,17 +128,23 @@ export class CommandService {
         .filter((command) => !types || types.includes(command.type))
         .filter((command) => !aggregateTypes || aggregateTypes.includes(command.aggregate_type))
         .sort((left, right) => left.created_at.localeCompare(right.created_at) || left.command_id.localeCompare(right.command_id));
-      const candidate = queued[0];
-      if (!candidate) return null;
 
-      candidate.status = 'claimed';
-      candidate.claimed_by = workerId;
-      candidate.claimed_at = nowIso();
-      candidate.attempts += 1;
-      candidate.lease_until = new Date(Date.now() + leaseMs).toISOString();
-      await this.store.saveCommand(candidate);
-      await this.store.logEvent('command_updated', { command_id: candidate.command_id, status: 'claimed' });
-      return candidate;
+      for (const candidate of queued) {
+        const claimed = await this.store.locks.withLocks([`command:${candidate.command_id}`], async () => {
+          const current = await this.store.loadCommand(candidate.command_id);
+          if (!current || current.status !== 'queued') return null; // Raced away.
+          current.status = 'claimed';
+          current.claimed_by = workerId;
+          current.claimed_at = nowIso();
+          current.attempts += 1;
+          current.lease_until = new Date(Date.now() + leaseMs).toISOString();
+          await this.store.saveCommand(current);
+          await this.store.logEvent('command_updated', { command_id: current.command_id, status: 'claimed' });
+          return current;
+        });
+        if (claimed) return claimed;
+      }
+      return null;
     });
   }
 
@@ -185,7 +192,7 @@ export class CommandService {
   /**
    * Host announces it is starting the real work (acked -> executing).
    * Executing assignments are exempt from cancellation revocation — the
-   * host re-checks the persisted task state and reports the outcome.
+   * host re-checks the persisted task status and reports the outcome.
    */
   async beginCommand(commandId) {
     return this.store.mutateCommand(commandId, null, (command) => {
@@ -218,8 +225,10 @@ export class CommandService {
 
   /**
    * Must run under the `commands` lock. Only CLAIMED and delivered
-   * assignments are redelivered — acked/executing ones belong to the host
-   * and are surfaced through the `resume` listing instead.
+   * assignments are redeliverable — acked/executing ones belong to the host
+   * and are surfaced through the `resume` listing instead. Each candidate
+   * is re-read under its record lock and re-validated, so a concurrent
+   * ack/begin that lands before the write is never overwritten.
    */
   async recoverExpiredLeasesUnsafe() {
     const commands = await this.store.listCommands();
@@ -231,53 +240,70 @@ export class CommandService {
       if (!redeliverable || !command.lease_until) continue;
       const leaseUntil = Date.parse(command.lease_until);
       if (!Number.isNaN(leaseUntil) && leaseUntil > now) continue;
+
       const previousStatus = command.status;
-      command.status = 'queued';
-      command.assignment_state = null;
-      command.claimed_by = null;
-      command.claimed_at = null;
-      command.lease_until = null;
-      await this.store.saveCommand(command);
-      recovered.push(command.command_id);
-      await this.store.logEvent('command_lease_recovered', { command_id: command.command_id, previous_status: previousStatus });
+      const recoveredId = await this.store.locks.withLocks([`command:${command.command_id}`], async () => {
+        const current = await this.store.loadCommand(command.command_id);
+        if (!current) return null;
+        const stillRedeliverable = current.status === 'claimed' ||
+          (current.status === 'waiting_agent' && current.assignment_state === 'delivered');
+        if (!stillRedeliverable) return null; // Raced with ack/begin/cancel.
+        const currentLease = Date.parse(current.lease_until ?? 0);
+        if (!Number.isNaN(currentLease) && currentLease > Date.now()) return null;
+        current.status = 'queued';
+        current.assignment_state = null;
+        current.claimed_by = null;
+        current.claimed_at = null;
+        current.lease_until = null;
+        await this.store.saveCommand(current);
+        await this.store.logEvent('command_lease_recovered', { command_id: current.command_id, previous_status: previousStatus });
+        return current.command_id;
+      });
+      if (recoveredId) recovered.push(recoveredId);
     }
     return recovered;
   }
 
   /**
-   * Cancel every command of an aggregate the host is not already executing.
-   * Queued/claimed are always revoked; waiting_agent assignments are revoked
-   * in the delivered AND acked states (the host re-checks persisted state
-   * before acting and treats a cancelled command as "do not proceed");
-   * executing assignments stay with the host.
+   * Cancel every command of a task the host is not already executing.
+   * Matching uses the stable `parent_task_id` (set on creation for every
+   * command derived from a task, including approval.apply whose aggregate
+   * is the approval) with a fallback to direct task aggregates for older
+   * records. Queued/claimed are always revoked; waiting_agent assignments
+   * are revoked in the delivered AND acked states; executing assignments
+   * stay with the host.
    */
   async cancelQueuedForAggregate(aggregateType, aggregateId) {
     return this.store.locks.withLocks(['commands'], async () => {
       const commands = await this.store.listCommands();
       const cancelled = [];
       for (const command of commands) {
-        if (command.aggregate_type !== aggregateType || command.aggregate_id !== aggregateId) continue;
+        const belongsToTask = command.parent_task_id === aggregateId ||
+          (command.aggregate_type === aggregateType && command.aggregate_id === aggregateId);
+        if (!belongsToTask) continue;
         const revocable = ['queued', 'claimed'].includes(command.status) ||
           (command.status === 'waiting_agent' && command.assignment_state !== 'executing');
         if (!revocable) continue;
-        // Take the record lock so a concurrent single-command writer cannot
-        // interleave between our status check and the write.
-        await this.store.locks.acquire(`command:${command.command_id}`);
-        try {
+        // Re-read and validate under the record lock so a concurrent
+        // single-command writer cannot interleave between check and write.
+        const cancelledId = await this.store.locks.withLocks([`command:${command.command_id}`], async () => {
           const current = await this.store.loadCommand(command.command_id);
+          if (!current) return null;
+          const currentBelongsTo = current.parent_task_id === aggregateId ||
+            (current.aggregate_type === aggregateType && current.aggregate_id === aggregateId);
+          if (!currentBelongsTo) return null;
           const stillRevocable = ['queued', 'claimed'].includes(current.status) ||
             (current.status === 'waiting_agent' && current.assignment_state !== 'executing');
-          if (!stillRevocable) continue;
+          if (!stillRevocable) return null;
           current.status = 'cancelled';
           current.assignment_state = null;
           current.completed_at = nowIso();
           current.error = { code: 'AGGREGATE_CANCELLED', message: '任务已取消，命令不再执行。' };
           await this.store.saveCommand(current);
-          cancelled.push(command.command_id);
-          await this.store.logEvent('command_cancelled', { command_id: command.command_id, aggregate_id: aggregateId });
-        } finally {
-          await this.store.locks.release(`command:${command.command_id}`);
-        }
+          await this.store.logEvent('command_cancelled', { command_id: current.command_id, aggregate_id: aggregateId });
+          return current.command_id;
+        });
+        if (cancelledId) cancelled.push(cancelledId);
       }
       return cancelled;
     });

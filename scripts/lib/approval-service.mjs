@@ -30,6 +30,13 @@ export class ApprovalService {
 
   async createApproval({ taskId, subtaskId = null, itemId = null, question, options = [], proposedAction = null }) {
     const approvalId = makeId('AP');
+
+    // Validation, record creation and task/item linkage share one canonical
+    // lock window (review T-05): a terminal task must not leave behind an
+    // orphaned pending approval, and a racing completion cannot attach a
+    // fresh approval to a finished task.
+    const targets = [{ kind: 'task', id: taskId }];
+    if (itemId) targets.push({ kind: 'item', id: itemId });
     const approval = {
       schema_version: 1,
       revision: 1,
@@ -47,27 +54,24 @@ export class ApprovalService {
       updated_at: nowIso(),
       resolved_at: null
     };
-    await this.store.saveApproval(approval);
-
-    const targets = [{ kind: 'task', id: taskId }];
-    if (itemId) targets.push({ kind: 'item', id: itemId });
-    await this.store.mutateGroup(targets, {
-      task: (task) => {
-        // Checked inside the task lock: a finished task cannot take new
-        // approvals, and a concurrent completion must not be re-opened.
-        if (['completed', 'cancelled', 'failed'].includes(task.status)) {
-          const error = new Error(`Task ${taskId} is ${task.status} and cannot take new approvals.`);
-          error.code = 'INVALID_STATE_TRANSITION';
-          throw error;
-        }
-        task.pending_approval_ids = task.pending_approval_ids ?? [];
-        if (!task.pending_approval_ids.includes(approvalId)) task.pending_approval_ids.push(approvalId);
-        task.status = 'waiting_owner';
-      },
-      item: itemId ? (item) => {
+    await this.store.locks.withLocks(targets.map(({ kind, id }) => `${kind}:${id}`), async () => {
+      const task = await this.store.loadTask(taskId);
+      if (['completed', 'cancelled', 'failed'].includes(task.status)) {
+        const error = new Error(`Task ${taskId} is ${task.status} and cannot take new approvals.`);
+        error.code = 'INVALID_STATE_TRANSITION';
+        throw error;
+      }
+      await this.store.saveApproval(approval);
+      task.pending_approval_ids = task.pending_approval_ids ?? [];
+      if (!task.pending_approval_ids.includes(approvalId)) task.pending_approval_ids.push(approvalId);
+      task.status = 'waiting_owner';
+      await this.store.saveTask(task);
+      if (itemId) {
+        const item = await this.store.loadItem(itemId);
         item.status = 'waiting_owner';
         item.approval_id = approvalId;
-      } : undefined
+        await this.store.saveItem(item);
+      }
     });
 
     await this.store.logEvent('approval_created', { task_id: taskId, approval_id: approvalId, item_id: itemId });
@@ -146,6 +150,7 @@ export class ApprovalService {
         type: 'approval.apply',
         aggregateType: 'approval',
         aggregateId: approvalId,
+        parentTaskId: approval.task_id,
         payload: { approval_id: approvalId },
         requestedBy: null
       });

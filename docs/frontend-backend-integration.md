@@ -1,6 +1,6 @@
 # WeLink Office Agent 前后端对接设计
 
-> **实现状态（2026-08-30，第二轮复审修复后）**：阶段一至四已实现并有测试覆盖（`test/`、`server/`、`scripts/lib/`、`web-console/src/api/`）。第一轮评审（`docs/reviews/frontend-backend-integration-phase-1-4-review-2026-08-30.md`）的 7 项 findings 经第二轮复审（`docs/reviews/2026-08-30-main-588860f-follow-up-review.md`）确认：F-01、F-04、F-07 与 SSE 加固关闭；F-02/F-05/F-06 的残余问题与 F-03 的崩溃恢复已在第二轮修复中关闭——任务读改写全部收口到锁内（含完成条件锁内重算）、显式 reply 标识未命中时不再回退唯一活动会话、assignment 协议引入 delivered/acked/executing 单调状态机（取消覆盖未开始执行的任务、恢复只重投 delivered、宿主执行前读取持久化任务状态）、幂等占位分 reserved/running 两阶段租约（可安全接管 vs 结果未知）。阶段五（附件与产物）与第 16 节列出的内容保持“明确不做”，相关能力开关为 false。OpenAPI/contracts 自动生成仍为 proposed：契约目前以 `server/schemas/` 为源，手工镜像在 `web-console/src/api/contracts.ts`。
+> **实现状态（2026-08-30，第三轮复审修复后）**：阶段一至四已实现并有测试覆盖（`test/`、`server/`、`scripts/lib/`、`web-console/src/api/`）。第一、二轮评审的 findings 已在第三轮修复中全部关闭，第三轮复审（`docs/reviews/2026-08-30-main-ece9507-third-review.md`）的 T-01~T-06 也已修复：幂等记录在 HTTP 响应发送前完成持久化（未过期 running 记录让重放等待，仅过期租约判 unknown_outcome）；claim/租约恢复/取消在集合锁之后逐条取得记录锁并重读验证，不再覆盖并发 ack/begin；命令携带 `parent_task_id`，任务取消会一并撤销 `approval.apply` 等派生命令；外部发送的 executing 预落盘在任务锁内复核终态，完成与外发在任务锁上串行，完成态任务不会新增 uncertain action；终态任务创建审批被整体拒绝且不留 pending 孤儿。阶段五（附件与产物）与第 16 节列出的内容保持“明确不做”，相关能力开关为 false。OpenAPI/contracts 自动生成仍为 proposed：契约目前以 `server/schemas/` 为源，手工镜像在 `web-console/src/api/contracts.ts`。开启 live 模式前仍需按文档 §15.5 用真实 `welink-cli` 完成端到端验收。
 
 ## 1. 文档用途
 

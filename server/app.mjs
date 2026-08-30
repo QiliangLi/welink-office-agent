@@ -85,11 +85,13 @@ export function createRouter(context) {
           idempotencyAttemptId = attemptId;
         }
 
-        // Capture the response so the idempotency record can store it.
+        // Capture the response instead of sending it: the idempotency
+        // record must be completed BEFORE the client can see the reply,
+        // otherwise an immediate replay would race the record and be
+        // misjudged as "outcome unknown" (review T-01).
         let captured = null;
         const reply = (status, data) => {
           captured = { status, data };
-          sendJson(res, status, data, requestId);
         };
 
         try {
@@ -97,9 +99,18 @@ export function createRouter(context) {
             await context.idempotencyService.markRunning(idempotencyRecordKey, idempotencyAttemptId);
           }
           await matched.handler({ req, res, params, query, repeat, body, requestId, reply, context, idempotencyKey });
-          if (idempotencyRecordKey && captured) {
+          if (!captured) {
+            // Handler produced no reply — fail the idempotency attempt and
+            // answer with a stable error instead of leaving the socket open.
+            if (idempotencyRecordKey) await context.idempotencyService.fail(idempotencyRecordKey, idempotencyAttemptId);
+            const noReply = toApiError(Object.assign(new Error('处理器未返回响应。'), { status: 500, code: 'INTERNAL_ERROR' }));
+            sendJson(res, noReply.status, { error: errorBody(noReply), requestId }, requestId);
+            return;
+          }
+          if (idempotencyRecordKey) {
             await context.idempotencyService.complete(idempotencyRecordKey, captured.status, captured.data ?? null);
           }
+          sendJson(res, captured.status, captured.data, requestId);
         } catch (handlerError) {
           if (idempotencyRecordKey) await context.idempotencyService.fail(idempotencyRecordKey, idempotencyAttemptId);
           throw handlerError;

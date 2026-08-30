@@ -112,6 +112,7 @@ export class TaskService {
       type: 'task.resume',
       aggregateType: 'task',
       aggregateId: taskId,
+      parentTaskId: taskId,
       requestedBy: task.created_by_employee_number
     });
     return { task, commandId: command.command_id };
@@ -126,6 +127,7 @@ export class TaskService {
       type: 'task.instruction',
       aggregateType: 'task',
       aggregateId: taskId,
+      parentTaskId: taskId,
       payload: { text },
       requestedBy: task.created_by_employee_number
     });

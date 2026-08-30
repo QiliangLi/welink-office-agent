@@ -41,8 +41,15 @@ export class SendService {
    * Persist the action as executing BEFORE invoking welink-cli, then update
    * to succeeded/dry_run/failed/unknown. This order is the basis for crash
    * recovery and duplicate-send prevention and must not be changed.
+   *
+   * For task-scoped sends the pre-persistence happens INSIDE the task lock
+   * (review T-04): the target task's terminal status is re-checked there, so
+   * a racing completeTask either sees the new executing action as a blocker
+   * or lands first and the send is refused — an uncertain action can never
+   * appear on a completed task. The lock is released before the CLI call; it
+   * is never held across external I/O.
    */
-  async executeSend({ actionType, targetType, targetId, cliArgs, content, taskId, subtaskId, approvalId, messageType, conversationId }) {
+  async executeSend({ actionType, targetType, targetId, cliArgs, content, taskId, subtaskId, approvalId, messageType, conversationId, rejectFinishedTask = false }) {
     const actionId = makeId('ACT');
     const action = {
       schema_version: 1,
@@ -61,7 +68,22 @@ export class SendService {
       created_at: nowIso(),
       updated_at: nowIso()
     };
-    await this.store.saveAction(action);
+
+    if (taskId) {
+      await this.store.locks.withLocks([`task:${taskId}`], async () => {
+        if (rejectFinishedTask) {
+          const task = await this.store.loadTask(taskId);
+          if (['completed', 'cancelled', 'failed', 'paused'].includes(task.status)) {
+            const error = new Error(`Task ${taskId} is ${task.status}; external send refused.`);
+            error.code = 'INVALID_STATE_TRANSITION';
+            throw error;
+          }
+        }
+        await this.store.saveAction(action); // executing, pre-persisted
+      });
+    } else {
+      await this.store.saveAction(action); // executing, pre-persisted
+    }
     await this.store.logEvent('action_started', {
       action_id: actionId,
       task_id: taskId ?? null,
@@ -120,6 +142,8 @@ export class SendService {
    * Send to a user through the contact slot. When the contact already has an
    * active conversation for another subtask, the send is NOT attempted: the
    * subtask is parked in the contact queue and the caller reports the wait.
+   * Private sends belong to the task workflow, so finished tasks refuse
+   * them (control-group notices go through sendGroup instead).
    */
   async sendUser({ employeeNumber, text, taskId = null, subtaskId = null, type = null }) {
     const contacts = await this.store.loadConfig('contacts');
@@ -166,7 +190,8 @@ export class SendService {
       taskId,
       subtaskId,
       messageType: type,
-      conversationId: conversation?.conversation_id ?? null
+      conversationId: conversation?.conversation_id ?? null,
+      rejectFinishedTask: true
     });
     if (conversation) {
       await this.store.mutateConversation(conversation.conversation_id, (current) => {
@@ -177,7 +202,13 @@ export class SendService {
     return { queued: false, action, result };
   }
 
-  async sendGroup({ groupId, text, taskId = null, subtaskId = null, approvalId = null, type = null }) {
+  /**
+   * Send to a group. Group sends default to allowing finished tasks because
+   * control-group notices (task created/cancelled summaries) target the
+   * control group while carrying the task id; callers that perform
+   * approval-driven content sends pass rejectFinishedTask explicitly.
+   */
+  async sendGroup({ groupId, text, taskId = null, subtaskId = null, approvalId = null, type = null, rejectFinishedTask = false }) {
     const groups = await this.store.loadConfig('groups');
     if (!groups[groupId]?.trusted) {
       const error = new Error(`Group is not configured as trusted: ${groupId}`);
@@ -199,7 +230,8 @@ export class SendService {
       taskId,
       subtaskId,
       approvalId,
-      messageType: type
+      messageType: type,
+      rejectFinishedTask
     });
   }
 }

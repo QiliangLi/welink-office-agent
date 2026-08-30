@@ -612,14 +612,230 @@ test('completion re-evaluates blockers inside the task lock (R-01 regression)', 
   const finalTask = await store.loadTask(task.task_id);
   const completion = results[0];
   const approvalResult = results[1];
+  const orphanApprovals = (await store.listApprovals())
+    .filter((entry) => entry.task_id === task.task_id && entry.status === 'pending');
   if (completion.status === 'fulfilled' && completion.value.ok) {
     assert.equal(finalTask.status, 'completed');
     assert.equal(approvalResult.status, 'rejected', 'approval cannot attach to a completed task');
     assert.equal(finalTask.pending_approval_ids.length, 0);
+    assert.equal(orphanApprovals.length, 0, 'no orphan pending approval on the completed task');
   } else {
     assert.equal(finalTask.status, 'waiting_owner', 'approval landed first and blocks completion');
     assert.equal(approvalResult.status, 'fulfilled');
     assert.equal(finalTask.pending_approval_ids.length, 1);
+    assert.equal(orphanApprovals.length, 1, 'the winning approval is the only pending record');
     assert.notEqual(finalTask.status, 'completed', 'completion never rides over fresh blockers');
+  }
+});
+
+test('lease recovery never overwrites a concurrent ack or begin (T-02)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+
+  for (let round = 0; round < 12; round += 1) {
+    const task = await tasks.createTask({ request: `恢复竞态 ${round}` });
+    const { command } = await commands.create({ type: 'task.create', aggregateType: 'task', aggregateId: task.task_id });
+    await commands.claimNext({ workerId: 'w1' });
+    await commands.markWaitingAgent(command.command_id, { leaseMs: 30 });
+    // Force the lease to its boundary so recovery is eligible.
+    const stale = await store.loadCommand(command.command_id);
+    stale.lease_until = new Date(Date.now() - 5).toISOString();
+    await store.saveCommand(stale);
+
+    const ackOutcome = await commands.ackCommand(command.command_id).then(
+      () => 'acked',
+      (error) => error.code,
+    );
+    const recovered = await commands.recoverExpiredLeases();
+    const final = await store.loadCommand(command.command_id);
+
+    if (ackOutcome === 'acked') {
+      assert.ok(!recovered.includes(command.command_id), `round ${round}: acked command must not be recovered`);
+      assert.equal(final.status, 'waiting_agent');
+      assert.equal(final.assignment_state, 'acked');
+    } else {
+      assert.equal(ackOutcome, 'INVALID_STATE_TRANSITION', `round ${round}: only ack rejection explains recovery`);
+      assert.ok(recovered.includes(command.command_id), `round ${round}: recovered command was not acked`);
+      assert.equal(final.status, 'queued');
+    }
+    await tasks.cancel(task.task_id); // cleanup for next round
+  }
+});
+
+test('cancelling a task revokes its approval.apply commands via parent_task_id (T-03)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+  const approvals = new ApprovalService(store, commands);
+  const groups = await store.loadConfig('groups');
+  const groupId = Object.keys(groups)[0];
+
+  const task = await tasks.createTask({ request: '取消审批命令任务' });
+  const approval = await approvals.createApproval({
+    taskId: task.task_id,
+    question: '发送周报',
+    proposedAction: {
+      type: 'send_message',
+      target_type: 'group',
+      target_id: groupId,
+      display_target: groups[groupId].name,
+      content: '大家好，项目周报已生成。'
+    }
+  });
+  const decision = await approvals.recordDecision({ approvalId: approval.approval_id, decision: 'approve', expectedRevision: approval.revision });
+  const applyCommand = await store.loadCommand(decision.commandId);
+  assert.equal(applyCommand.parent_task_id, task.task_id, 'approval.apply carries the parent task id');
+
+  const { cancelledCommands } = await tasks.cancel(task.task_id);
+  assert.ok(cancelledCommands.includes(decision.commandId), 'cancellation revokes the approval.apply command');
+  assert.equal((await store.loadCommand(decision.commandId)).status, 'cancelled');
+
+  // Tick must not resurrect or execute it.
+  const { runCli } = await import('./helpers.mjs');
+  const tick = await runCli(root, ['tick']);
+  assert.equal(tick.parsed.executed.find((entry) => entry.command_id === decision.commandId), undefined);
+  assert.equal((await store.loadCommand(decision.commandId)).status, 'cancelled');
+
+  // No send ever landed on the wire for this task.
+  const messages = await store.readJsonlAll('messages.jsonl');
+  assert.equal(messages.filter((entry) => entry.direction === 'outbound' && entry.task_id === task.task_id).length, 0);
+});
+
+test('action pre-persistence serializes with task completion (T-04)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+  const sends = new SendService(store);
+
+  const task = await tasks.createTask({ request: '完成与外发竞态' });
+  const subtask = await tasks.addSubtask(task.task_id, { title: '询问', target_employee_number: '00123456' });
+
+  // Barrier: hold the task lock (the completion critical section) and prove
+  // the send cannot pre-persist its action outside the lock.
+  await store.locks.acquire(`task:${task.task_id}`);
+  let sendSettled = false;
+  const sendPromise = sends.executeSend({
+    actionType: 'send_user_message',
+    targetType: 'user',
+    targetId: '00123456',
+    cliArgs: ['im', 'send-to-user', '--receiver', 'z00123456', '--text', '竞态消息'],
+    content: '竞态消息',
+    taskId: task.task_id,
+    subtaskId: subtask.subtask_id,
+    rejectFinishedTask: true
+  }).then(
+    (value) => { sendSettled = true; return value; },
+    (error) => { sendSettled = true; throw error; },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(sendSettled, false, 'send waits for the task lock');
+  assert.equal((await store.listActions()).length, 0, 'action is never pre-persisted outside the task lock');
+  await store.locks.release(`task:${task.task_id}`);
+
+  // Whichever write wins the lock, the invariant must hold:
+  // a completed task never carries an uncertain action.
+  const completion = await tasks.completeTask(task.task_id).then(
+    (value) => value,
+    (error) => ({ ok: false, error }),
+  );
+  const outcome = await sendPromise.then(
+    () => 'sent',
+    (error) => error.code,
+  );
+  const finalTask = await store.loadTask(task.task_id);
+  const taskActions = (await store.listActions()).filter((action) => action.task_id === task.task_id);
+
+  if (completion.ok) {
+    assert.equal(finalTask.status, 'completed');
+    assert.equal(outcome, 'INVALID_STATE_TRANSITION', 'send after completion is refused');
+    assert.equal(taskActions.length, 0, 'no action landed on a completed task');
+  } else {
+    assert.equal(finalTask.status, 'running', 'completion is blocked by the fresh action');
+    assert.equal(outcome, 'sent');
+    assert.ok(taskActions.some((action) => ['executing', 'dry_run', 'succeeded'].includes(action.status)), 'action exists and blocks completion');
+  }
+});
+
+test('deterministic orders: completed task refuses sends, fresh action blocks completion (T-04)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+  const sends = new SendService(store);
+
+  // Order A: completion first, send after -> refused, no action file.
+  const taskA = await tasks.createTask({ request: '顺序 A' });
+  const subA = await tasks.addSubtask(taskA.task_id, { title: '询问', target_employee_number: '00123456' });
+  await tasks.updateSubtask(taskA.task_id, subA.subtask_id, { status: 'completed' });
+  await tasks.completeTask(taskA.task_id);
+  await assert.rejects(
+    () => sends.executeSend({
+      actionType: 'send_user_message',
+      targetType: 'user',
+      targetId: '00123456',
+      cliArgs: ['im', 'send-to-user', '--receiver', 'z00123456', '--text', 'x'],
+      content: 'x',
+      taskId: taskA.task_id,
+      subtaskId: subA.subtask_id,
+      rejectFinishedTask: true
+    }),
+    (error) => error.code === 'INVALID_STATE_TRANSITION',
+  );
+  assert.equal((await store.listActions()).filter((action) => action.task_id === taskA.task_id).length, 0);
+
+  // Order B: send first (executing action lands), completion after -> blocked.
+  const taskB = await tasks.createTask({ request: '顺序 B' });
+  const subB = await tasks.addSubtask(taskB.task_id, { title: '询问', target_employee_number: '00678901' });
+  const send = await sends.executeSend({
+    actionType: 'send_user_message',
+    targetType: 'user',
+    targetId: '00678901',
+    cliArgs: ['im', 'send-to-user', '--receiver', 'l00678901', '--text', 'y'],
+    content: 'y',
+    taskId: taskB.task_id,
+    subtaskId: subB.subtask_id,
+    rejectFinishedTask: true
+  });
+  assert.equal(send.action.status, 'dry_run');
+  const completion = await tasks.completeTask(taskB.task_id);
+  assert.equal(completion.ok, false, 'uncertain/in-flight action blocks completion');
+  assert.ok(completion.blocking.uncertain_actions.length > 0 || completion.blocking.waiting_replies.length > 0);
+});
+
+test('createApproval on a terminal task leaves no orphan pending record (T-05)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+  const approvals = new ApprovalService(store, commands);
+
+  for (const status of ['completed', 'cancelled', 'failed']) {
+    const task = await tasks.createTask({ request: `终态任务 ${status}` });
+    await tasks.changeStatus(task.task_id, status);
+    await assert.rejects(
+      () => approvals.createApproval({ taskId: task.task_id, question: '不应创建' }),
+      (error) => error.code === 'INVALID_STATE_TRANSITION',
+    );
+    assert.equal((await store.listApprovals()).filter((entry) => entry.task_id === task.task_id).length, 0, `${status}: no orphan approval`);
+    assert.equal((await store.loadTask(task.task_id)).pending_approval_ids.length, 0);
   }
 });

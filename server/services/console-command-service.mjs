@@ -76,6 +76,7 @@ export class ConsoleCommandService {
         type: 'task.retry',
         aggregateType: 'task',
         aggregateId: taskId,
+        parentTaskId: taskId,
         payload: {},
         requestedBy: task.created_by_employee_number
       });
@@ -123,6 +124,7 @@ export class ConsoleCommandService {
       type: 'subtask.remind',
       aggregateType: 'task',
       aggregateId: taskId,
+      parentTaskId: taskId,
       payload: { task_id: taskId, subtask_id: subtaskId },
       requestedBy: requestedBy ?? task.created_by_employee_number
     });

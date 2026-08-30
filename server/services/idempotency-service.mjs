@@ -82,10 +82,24 @@ export class IdempotencyService {
           return { replay: { statusCode: existing.status_code, response: existing.response } };
         }
         if (existing.status === 'running') {
-          // Side effects may or may not have happened — never blind-retry.
-          throw conflictError('IDEMPOTENCY_CONFLICT',
-            '上一次相同请求的结果未知，请先查询相关任务或命令状态，不要直接重试。',
-            { phase: 'unknown_outcome', attemptId: existing.attempt_id });
+          // The handler of the first request may still be running: wait for
+          // it to complete like any other in-flight duplicate. Only an
+          // EXPIRED running lease (process died mid-handler) means the
+          // outcome is truly unknown — never blind-retry that.
+          const leaseUntil = Date.parse(existing.lease_until ?? 0);
+          const expired = Number.isNaN(leaseUntil) || leaseUntil <= Date.now();
+          if (expired) {
+            throw conflictError('IDEMPOTENCY_CONFLICT',
+              '上一次相同请求的结果未知，请先查询相关任务或命令状态，不要直接重试。',
+              { phase: 'unknown_outcome', attemptId: existing.attempt_id });
+          }
+          if (Date.now() >= deadline) {
+            throw conflictError('IDEMPOTENCY_CONFLICT',
+              '上一次相同请求的结果未知，请先查询相关任务或命令状态，不要直接重试。',
+              { phase: 'unknown_outcome', attemptId: existing.attempt_id });
+          }
+          await new Promise((resolve) => setTimeout(resolve, WAIT_INTERVAL_MS));
+          continue;
         }
         // reserved: expired reservations can be taken over safely (the
         // handler never started); live ones mean another request is racing.

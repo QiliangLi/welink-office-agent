@@ -63,24 +63,26 @@ Actions additionally carry `conversation_id` linking the send to its conversatio
 
 ## Commands (`runtime/commands/*.json`)
 
-One file per command with `command_id`, `type` (`task.create`, `task.resume`, `task.cancel`, `task.instruction`, `task.retry`, `subtask.remind`, `approval.apply`), `aggregate_type`/`aggregate_id`, `idempotency_key`, `payload`, `attempts`, `lease_until`, `assignment_state`, `error`.
+One file per command with `command_id`, `type` (`task.create`, `task.resume`, `task.cancel`, `task.instruction`, `task.retry`, `subtask.remind`, `approval.apply`), `aggregate_type`/`aggregate_id`, `parent_task_id`, `idempotency_key`, `payload`, `attempts`, `lease_until`, `assignment_state`, `error`.
 
 Statuses: `queued` -> `claimed` (lease) -> `waiting_agent` (deterministic part done, Agent reasoning pending) -> `succeeded` | `failed` (retryable via `error.code`) | `cancelled`.
 
-All transitions are monotonic and validated inside the record lock: a cancelled command can never enter waiting_agent/succeeded, `releaseClaim` only releases claimed commands, and `complete` on a cancelled command is a no-op. Scanning paths (claim/cancel/recover) hold the `commands` collection lock; cancellation takes the collection lock plus each record's lock, so it cannot interleave with a single-command writer.
+All transitions are monotonic AND re-validated under the record's own `command:<id>` lock: every writer — including the scanning paths — re-reads the current record and checks the transition before saving, so a cancelled command can never enter waiting_agent/succeeded and a stale snapshot can never overwrite a concurrent ack/begin. Scanning paths (claim, lease recovery, cancellation) hold the `commands` collection lock first and then take each candidate's record lock one by one (collection before record, never the reverse). `releaseClaim` only releases claimed commands; `complete` on a cancelled command is a no-op.
+
+Commands derived from a task carry a stable `parent_task_id` (approval.apply points at its parent task even though its aggregate is the approval), so cancellation reaches every derived command.
 
 Assignment delivery protocol: a command handed to the host Agent as a tick assignment becomes `waiting_agent` with `assignment_state=delivered` and keeps its lease. The host confirms via `ack-command` (`assignment_state=acked`) and announces execution via `begin-command` (`assignment_state=executing`). Rules:
 
 - delivered + lease expired -> back to `queued` (redelivery after a host crash);
 - acked/executing are never auto-redelivered — a restarted host finds them through the `resume` listing (`pending_commands`);
-- task cancellation revokes queued/claimed/delivered/acked commands; executing ones stay with the host, which re-reads the task's persisted status before acting and reports the outcome via `complete-command`;
+- task cancellation revokes queued/claimed/delivered/acked commands whose `parent_task_id` matches; executing ones stay with the host, which re-reads the task's persisted status before acting and reports the outcome via `complete-command`;
 - `complete`/`failed` on a cancelled command is a no-op — cancellation always wins.
 
 ## Idempotency records (`runtime/idempotency/*.json`)
 
 One file per hash of (owner, route pattern, Idempotency-Key), persisted by the Console API's unified idempotency layer: `{ key, fingerprint, route, status, attempt_id, lease_until, status_code?, response? }`.
 
-Placeholder lifecycle: `reserved` (begin placed it, handler not started, short lease — an expired reservation is safely taken over by the next identical request with a fresh attempt id) -> `running` (handler executing, longer lease) -> `completed` (first response stored) or removed (handler failed before side effects). Same key + same fingerprint (path + normalized body) replays the first completed response; same key with a different fingerprint is `409 IDEMPOTENCY_CONFLICT`. A crash while `running` leaves the outcome unknown: replays get `409 IDEMPOTENCY_CONFLICT` with `details.phase="unknown_outcome"` and must query the affected aggregate (task/command status) instead of blindly retrying; such records are never auto-deleted.
+Placeholder lifecycle: `reserved` (begin placed it, handler not started, short lease — an expired reservation is safely taken over by the next identical request with a fresh attempt id) -> `running` (handler executing, longer lease) -> `completed` (first response stored; the HTTP reply is sent only AFTER this write, so an immediate replay always finds it) or removed (handler failed before side effects). Same key + same fingerprint (path + normalized body) replays the first completed response; same key with a different fingerprint is `409 IDEMPOTENCY_CONFLICT`. A `running` record with a live lease means the first request is still in flight and replays wait for it. A crash while `running` leaves the outcome unknown: once the lease expires, replays get `409 IDEMPOTENCY_CONFLICT` with `details.phase="unknown_outcome"` and must query the affected aggregate (task/command status) instead of blindly retrying; such records are never auto-deleted.
 
 ## Conversations (`runtime/conversations/*.json`)
 
@@ -88,7 +90,7 @@ One active conversation per `contact_key`. Fields: `conversation_id`, `contact_t
 
 ## Reply attribution
 
-Priority order: explicit reply/thread id (`correlation_id`/`conversation_id`) matched across ALL conversations of the contact (closed ones included, so a late reply to a closed session lands on its original task) -> the single ACTIVE conversation for the contact -> `unattributed` (no active conversation) -> `unresolved_multiple` (several candidates). The raw message log entry is persisted before any related state is mutated. Only `attributed` replies may advance a task; message log entries carry `attribution_status`, `conversation_id`, `task_id`, `subtask_id`.
+Priority order: (1) explicit reply/thread id (`correlation_id`/`conversation_id`) matched across ALL conversations of the contact (closed ones included, so a late reply to a closed session lands on its original task); (2) STOP RULE — if an explicit marker exists but matches nothing, the reply is `unattributed` with reason `explicit_marker_unmatched`; it must never fall through to the unique-active heuristic; (3) the single ACTIVE conversation for the contact, only when NO marker was supplied; (4) `unattributed` (no active conversation); (5) `unresolved_multiple` (several candidates). The raw message log entry is persisted before any related state is mutated. Only `attributed` replies may advance a task; message log entries carry `attribution_status`, `attribution_reason`, `conversation_id`, `task_id`, `subtask_id`.
 
 ## Identity rules
 
