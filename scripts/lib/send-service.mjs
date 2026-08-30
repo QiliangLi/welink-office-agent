@@ -1,7 +1,12 @@
 import { hashText, makeId } from './ids.mjs';
 import { nowIso } from './utils.mjs';
 import { runWelink } from './welink.mjs';
-import { acquireContactSlot, releaseContactSlot } from './contact-slots.mjs';
+import {
+  TERMINAL_CHAT_STATUSES,
+  acquireContactSlot,
+  releaseContactSlot
+} from './contact-slots.mjs';
+import { loadConversation } from './conversations.mjs';
 
 function agentSuffix(policies, metadata = {}) {
   const meta = Object.entries(metadata)
@@ -123,19 +128,42 @@ export class SendService {
       status: finalAction.status
     });
 
-    if (taskId && subtaskId && result.ok) {
-      await this.store.mutateTask(taskId, undefined, (task) => {
-        const subtask = task.subtasks?.find((entry) => entry.subtask_id === subtaskId);
-        if (!subtask) return;
-        subtask.status = 'waiting_reply';
-        subtask.waiting_kind = null;
-        subtask.waiting_reason = null;
-        subtask.communication.round += 1;
-        subtask.communication.first_contact_at ??= nowIso();
-        subtask.communication.last_contact_at = nowIso();
-        subtask.conversation_id = conversationId ?? subtask.conversation_id;
-        subtask.next_action = { type: 'wait_reply' };
-      });
+    // Post-send bookkeeping (review W-01): the subtask moves to
+    // waiting_reply only for a task that is still live. A task that reached
+    // a terminal state while the CLI was running must not be revived — and
+    // once the action has settled, this send's conversation is closed and
+    // the contact slot moves to the next queued candidate here, the safe
+    // settlement point (cancel/complete deliberately skip such
+    // conversations while the action is executing/unknown).
+    if (taskId) {
+      let finishedDuringSend = false;
+      if (subtaskId && result.ok) {
+        await this.store.mutateTask(taskId, undefined, (task) => {
+          if (TERMINAL_CHAT_STATUSES.includes(task.status)) {
+            finishedDuringSend = true;
+            return;
+          }
+          const subtask = task.subtasks?.find((entry) => entry.subtask_id === subtaskId);
+          if (!subtask) return;
+          subtask.status = 'waiting_reply';
+          subtask.waiting_kind = null;
+          subtask.waiting_reason = null;
+          subtask.communication.round += 1;
+          subtask.communication.first_contact_at ??= nowIso();
+          subtask.communication.last_contact_at = nowIso();
+          subtask.conversation_id = conversationId ?? subtask.conversation_id;
+          subtask.next_action = { type: 'wait_reply' };
+        });
+      } else {
+        const task = await this.store.loadTask(taskId).catch(() => null);
+        finishedDuringSend = Boolean(task && TERMINAL_CHAT_STATUSES.includes(task.status));
+      }
+      if (finishedDuringSend && conversationId) {
+        const conversation = await loadConversation(this.store, conversationId);
+        if (conversation && conversation.status === 'active') {
+          await releaseContactSlot(this.store, conversation, { reason: 'task_finished_during_send' });
+        }
+      }
     }
 
     return { action: finalAction, result };

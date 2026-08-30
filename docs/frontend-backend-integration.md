@@ -869,7 +869,7 @@ Browser        Console API        Runtime Store       Agent tick
 
 暂停提交后，API 立即把任务状态改为 paused。已经执行中的外部 CLI 不能强行中断，完成后 action 仍然落盘，但 tick 不再领取该任务的新命令。
 
-取消提交后，API 把任务状态改为 cancelled，并取消尚未 claimed 的关联命令。已经发送的消息、已记录回复和产物保留。Agent 下轮判断是否需要向相关联系人发送停止通知；若需要外部发送，仍遵守策略和审批规则。
+取消提交后，API 把任务状态改为 cancelled，并取消尚未 claimed 的关联命令（含按 `parent_task_id` 关联的 `approval.apply` 等派生命令）。已经发送的消息、已记录回复和产物保留。任务遗留的联系人会话按收口状态处理：外发 action 已收口（succeeded/failed/dry_run）的会话立即释放并把槽位移交给下一个有效候选；仍在 `executing`/`unknown` 的会话保持占用，由该外发的落盘路径在安全收口点关闭并晋升，避免同一联系人出现两条重叠的外发。已终态任务的子任务不会在外发收口后被写回 `waiting_reply`。Agent 下轮判断是否需要向相关联系人发送停止通知；若需要外部发送，仍遵守策略和审批规则。
 
 ### 9.5 同一联系人任务排队
 

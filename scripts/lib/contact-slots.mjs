@@ -57,23 +57,52 @@ export async function queuePositionFor(store, contactKey, taskId, subtaskId) {
 
 const TERMINAL_CHAT_STATUSES = ['completed', 'cancelled', 'failed', 'paused'];
 
+export { TERMINAL_CHAT_STATUSES };
+
 /**
- * Release every active conversation a task still holds. Called when a task
+ * Release the active conversations a task still holds. Called when a task
  * reaches a terminal state so a conversation created while the task was
  * running cannot block later tasks for the same contact after the task is
  * gone (U-01/V-01 family). Runs outside the task lock: releaseContactSlot
  * takes its own slot lock, and slot locks are never taken while holding a
  * task lock.
+ *
+ * Conversations whose outbound action is still `executing` or `unknown` are
+ * deliberately KEPT active (review W-01): handing the slot to the next task
+ * before the CLI result lands would allow two overlapping private sends to
+ * the same contact. The send's completion path (executeSend) closes such a
+ * conversation once the action settles; `unknown` results stay with the
+ * host's recovery flow until it closes the conversation explicitly.
+ * Candidate actions are re-read under their action lock so the check cannot
+ * race the send's own result write.
  */
 export async function releaseTaskConversations(store, taskId, { reason = 'task_finished' } = {}) {
   const conversations = await store.listConversations();
+  const actions = await store.listActions();
   const released = [];
+  const kept = [];
   for (const conversation of conversations) {
     if (conversation.task_id !== taskId || conversation.status !== 'active') continue;
+    const candidates = actions.filter((action) =>
+      action.task_id === taskId &&
+      action.conversation_id === conversation.conversation_id &&
+      ['executing', 'unknown'].includes(action.status));
+    let unsettled = false;
+    for (const candidate of candidates) {
+      await store.locks.withLocks([`action:${candidate.action_id}`], async () => {
+        const current = await store.loadAction(candidate.action_id).catch(() => null);
+        if (current && ['executing', 'unknown'].includes(current.status)) unsettled = true;
+      });
+      if (unsettled) break;
+    }
+    if (unsettled) {
+      kept.push(conversation.conversation_id);
+      continue;
+    }
     const result = await releaseContactSlot(store, conversation, { reason });
     if (result.released) released.push(conversation.conversation_id);
   }
-  return released;
+  return { released, kept };
 }
 
 function terminalRefusal(taskId, status) {

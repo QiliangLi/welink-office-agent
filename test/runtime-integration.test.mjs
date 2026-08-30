@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import { Store } from '../scripts/lib/store.mjs';
 import { CommandService } from '../scripts/lib/commands.mjs';
 import { TaskService } from '../scripts/lib/task-service.mjs';
@@ -1014,4 +1015,105 @@ test('release skips candidates whose task turned terminal while queued (V-01 pro
   const actives = (await store.listConversations()).filter((entry) => entry.status === 'active');
   assert.equal(actives.length, 1);
   assert.equal(actives[0].task_id, taskC.task_id);
+});
+
+test('cancel while the outbound CLI is running keeps the slot until the action settles (W-01)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  // Controllable delayed CLI stand-in: succeeds after ~1s.
+  const fsSync = await import('node:fs');
+  const binDir = path.join(root, 'fixture-bin');
+  await fs.mkdir(binDir, { recursive: true });
+  const cliPath = path.join(binDir, 'welink-cli');
+  await fs.writeFile(cliPath, '#!/bin/sh\nsleep 1\necho "sent"\nexit 0\n', { mode: 0o755 });
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${previousPath}`;
+  t.after(() => { process.env.PATH = previousPath; });
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+  const sends = new SendService(store);
+  const { acquireContactSlot } = await import('../scripts/lib/contact-slots.mjs');
+
+  // Live mode: the delayed stand-in is actually invoked.
+  const policiesPath = path.join(root, 'config/policies.json');
+  const policies = JSON.parse(await fs.readFile(policiesPath, 'utf8'));
+  policies.dry_run = false;
+  await fs.writeFile(policiesPath, JSON.stringify(policies, null, 2));
+
+  // Task A acquires the slot and starts a real (delayed) send.
+  const taskA = await tasks.createTask({ request: '取消竞态任务 A' });
+  const subA = await tasks.addSubtask(taskA.task_id, { title: '询问王璐', target_employee_number: '00123456' });
+  const sendPromise = sends.sendUser({ employeeNumber: '00123456', text: 'A 的问题', taskId: taskA.task_id, subtaskId: subA.subtask_id });
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  const executingA = (await store.listActions()).find((action) => action.task_id === taskA.task_id);
+  assert.equal(executingA.status, 'executing', 'A action is pre-persisted as executing');
+
+  // Task B queues behind A.
+  const taskB = await tasks.createTask({ request: '排队任务 B' });
+  const subB = await tasks.addSubtask(taskB.task_id, { title: '联系王璐', target_employee_number: '00123456' });
+  const queued = await acquireContactSlot(store, { contactType: 'user', contactId: '00123456', taskId: taskB.task_id, subtaskId: subB.subtask_id });
+  assert.equal(queued.acquired, false);
+
+  // The user cancels A while its CLI is still running.
+  await tasks.cancel(taskA.task_id);
+  assert.equal((await store.loadTask(taskA.task_id)).status, 'cancelled');
+
+  // The slot must NOT move to B before A's action settles: B's send still
+  // queues, and no second executing action can exist.
+  const earlyB = await sends.sendUser({ employeeNumber: '00123456', text: 'B 的问题', taskId: taskB.task_id, subtaskId: subB.subtask_id });
+  assert.equal(earlyB.queued, true, 'B still waits while A action is unsettled');
+  let executingCount = (await store.listActions()).filter((action) => action.status === 'executing').length;
+  assert.equal(executingCount, 1, 'only A action is executing');
+  const activeAfterCancel = (await store.listConversations()).filter((entry) => entry.status === 'active');
+  assert.equal(activeAfterCancel.length, 1);
+  assert.equal(activeAfterCancel[0].task_id, taskA.task_id, 'A keeps the slot until its action settles');
+
+  // A's CLI returns: the action settles, the cancelled subtask must NOT be
+  // revived to waiting_reply, and the slot moves to B.
+  await sendPromise;
+  const settledA = await store.loadAction(executingA.action_id);
+  assert.equal(settledA.status, 'succeeded');
+  const taskAFinal = await store.loadTask(taskA.task_id);
+  const subAFinal = taskAFinal.subtasks.find((entry) => entry.subtask_id === subA.subtask_id);
+  assert.notEqual(subAFinal.status, 'waiting_reply', 'cancelled subtask is never revived');
+  assert.equal(taskAFinal.status, 'cancelled');
+
+  const activeAfterSettle = (await store.listConversations()).filter((entry) => entry.status === 'active');
+  assert.equal(activeAfterSettle.length, 1);
+  assert.equal(activeAfterSettle[0].task_id, taskB.task_id, 'B is promoted only after A settles');
+
+  // B can now send through its own promoted conversation.
+  const lateB = await sends.sendUser({ employeeNumber: '00123456', text: 'B 的问题', taskId: taskB.task_id, subtaskId: subB.subtask_id });
+  assert.equal(lateB.queued, false);
+  executingCount = (await store.listActions()).filter((action) => action.status === 'executing').length;
+  assert.ok(executingCount <= 1, 'A and B never execute simultaneously');
+  await new Promise((resolve) => setTimeout(resolve, 1200)); // let the delayed CLI settle
+});
+
+test('cancel with no unsettled actions releases the conversation immediately (W-01 safe path)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+  const sends = new SendService(store);
+
+  const task = await tasks.createTask({ request: '取消释放任务' });
+  const sub = await tasks.addSubtask(task.task_id, { title: '询问王璐', target_employee_number: '00123456' });
+  await sends.sendUser({ employeeNumber: '00123456', text: '问题', taskId: task.task_id, subtaskId: sub.subtask_id });
+  assert.equal((await store.listConversations()).filter((entry) => entry.status === 'active').length, 1);
+
+  await tasks.cancel(task.task_id);
+  assert.equal((await store.listConversations()).filter((entry) => entry.status === 'active').length, 0, 'settled conversation is released on cancel');
+
+  const next = await tasks.createTask({ request: '后续任务' });
+  const nextSub = await tasks.addSubtask(next.task_id, { title: '联系王璐', target_employee_number: '00123456' });
+  const result = await sends.sendUser({ employeeNumber: '00123456', text: '新问题', taskId: next.task_id, subtaskId: nextSub.subtask_id });
+  assert.equal(result.queued, false);
 });
