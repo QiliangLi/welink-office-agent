@@ -659,3 +659,96 @@ svg { width: 18px; height: 18px; stroke-width: 1.9; }
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
   .timeline-flow-marker { display: none; }
 }
+
+/* Console API integration: health chips, banners, skeletons, prompt dialog */
+.agent-health { gap: 8px; }
+.agent-health .dry-run-chip,
+.agent-health .backlog-chip {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.agent-health .dry-run-chip { background: var(--warning-soft); color: var(--warning); }
+.agent-health .backlog-chip { background: var(--primary-soft); color: var(--primary); }
+.agent-health-degraded { color: var(--warning); }
+.agent-health-degraded i { background: var(--warning); }
+
+.bell-badge {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--danger);
+  color: var(--on-primary);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+.topbar .icon-button { position: relative; }
+
+.app-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 22px;
+  font-size: 13px;
+  border-bottom: 1px solid var(--border);
+}
+.app-banner svg { flex: none; width: 16px; height: 16px; }
+.app-banner-danger { background: var(--danger-soft); color: var(--danger); }
+.app-banner-warn { background: var(--warning-soft); color: var(--warning); }
+.detail-recovery-hint { margin-top: 10px; padding: 10px 14px; border: 1px solid var(--border); border-radius: var(--radius-control); }
+
+.skeleton-card { min-height: 118px; border-radius: var(--radius-card); }
+.skeleton-panel {
+  border-radius: var(--radius-panel);
+  background: linear-gradient(100deg, var(--surface-subtle) 40%, var(--surface-strong) 50%, var(--surface-subtle) 60%);
+  background-size: 200% 100%;
+  animation: skeleton-shine 1.4s ease-in-out infinite;
+}
+@keyframes skeleton-shine {
+  from { background-position: 120% 0; }
+  to { background-position: -80% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-panel { animation: none; }
+}
+
+.overview-error,
+.not-found .button + .button { margin-left: 8px; }
+.overview-error {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+  padding: 24px;
+  color: var(--danger);
+}
+.overview-error h2 { color: var(--text-primary); }
+
+.toast-danger { background: var(--danger); }
+.toast-danger svg { color: #fff; }
+
+.dialog-input {
+  width: 100%;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  color: var(--text-primary);
+  font: inherit;
+  resize: vertical;
+}
+.dialog-input:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+
+.attachment-disabled { opacity: 0.6; cursor: not-allowed; }
+
+.timeline-more { margin-top: 10px; }
+.approval-error { margin: 0 0 4px; }

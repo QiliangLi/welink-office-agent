@@ -9,6 +9,7 @@
     "preflight": "node scripts/agent.mjs preflight",
     "status": "node scripts/agent.mjs status",
     "resume": "node scripts/agent.mjs resume",
+    "server": "node server/index.mjs",
     "test": "node --test test/*.test.mjs"
   },
   "engines": {

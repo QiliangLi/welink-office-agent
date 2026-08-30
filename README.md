@@ -8,14 +8,21 @@
 
 - 可直接安装的根目录 `SKILL.md`；
 - 独立的 runtime/CLI；
-- JSON 配置与任务快照；
-- JSONL 消息和事件日志；
+- JSON 配置与任务快照（快照带 `revision`，跨进程文件锁保护并发写入）；
+- JSONL 消息和事件日志（带单调 `sequence`，供时间线与 SSE 排序）；
 - 主任务、子任务、动态事项、审批、外部动作状态；
 - 发送消息前落盘及中断恢复信息；
+- 持久化命令队列（`runtime/commands/`）：控制台写入先落盘，再由 `tick` 消费；
+- 联系人沟通槽：同一联系人默认只有一个活动私聊会话，其余子任务排队（`waiting_kind=contact_slot`）；
+- 会话记录与回复归属（`runtime/conversations/`）：优先 reply/thread 标识，其次唯一活动会话，多候选保持未归属；
 - 用户/群消息统一追加 Agent 标记；
 - WeLink CLI 查询与发送包装器；
-- `status`、`resume` 和主任务收口检查；
+- `status`、`resume`、`tick` 和主任务收口检查；
+- 本机 Console API（`server/`，默认 `127.0.0.1:4174`）：只读 DTO、创建任务、暂停/继续/取消、审批决定、催办、SSE 实时通知；
+- 桌面 Web 控制台接入真实 API（`VITE_DATA_SOURCE=mock` 可切回演示数据）；
 - 默认 dry-run。
+
+尚未实现：附件上传（页面隐藏入口）、产物下载、多用户/远程访问。控制台不能直接调用 `welink-cli`，也不能读取 `runtime/` 文件。
 
 当前 IM 查询结果仍由宿主 Agent 解析，因为已提供的 WeLink CLI 文档没有说明 IM 模块存在统一 JSON 输出。原始 CLI 输出会保存到 `runtime/raw/`。
 
@@ -26,9 +33,9 @@
 - 支持目录式 Skills、能够读取 `SKILL.md` 并执行本地命令的 Agent；
 - Skill 运行时能够访问本目录中的配置和 runtime 数据。
 
-根目录 runtime/CLI 没有第三方 npm 依赖，不需要执行 `npm install`。开发 Web 控制台时需在 `web-console/` 中安装其前端依赖。
+根目录 runtime/CLI/Console API 没有第三方 npm 依赖，不需要执行 `npm install`。开发 Web 控制台时需在 `web-console/` 中安装其前端依赖。
 
-核心 CLI 位于 `scripts/agent.mjs`。完整目录职责和文档同步规则见 `AGENTS.md`。
+核心 CLI 位于 `scripts/agent.mjs`，Console API 位于 `server/index.mjs`。完整目录职责和文档同步规则见 `AGENTS.md`。
 
 ## 安装为 Skill
 
@@ -106,7 +113,7 @@ Skill 会：
 $welink-office-agent tick
 ```
 
-每次只处理一个有边界的 Tick：恢复状态、查询新消息、更新任务、创建动态事项、发送到期追问和输出变化。如果目标 Agent 支持定时或循环任务，可以按它的原生方式定期调用 `tick`。
+每次只处理一个有边界的 Tick：先恢复状态，再消费 Web 控制台落盘的命令队列（任务规划、追加指令、催办、审批后续），输出需要推理的分配项，最后查询新消息、更新任务、创建动态事项、发送到期追问并输出变化。`tick` 会返回 `assignments`（需要宿主 Agent 推理的工作）、`executed`（确定性命令的执行结果）和 `due_followups`；宿主 Agent 完成推理后用 `complete-command` 回写命令结果。如果目标 Agent 支持定时或循环任务，可以按它的原生方式定期调用 `tick`。
 
 ### 查看状态
 
@@ -127,6 +134,28 @@ $welink-office-agent resume
 ```
 
 恢复完成后继续按目标 Agent 的原生循环或定时机制调用 `tick`。
+
+## Web 控制台与 Console API
+
+Web 控制台通过本机 Console API（`server/`）读写 runtime，不直接访问文件或 `welink-cli`。API 只监听 `127.0.0.1`，写请求需要 Origin 校验和 CSRF token，外部发送仍走共享 wrapper。
+
+开发模式（两个进程）：
+
+```bash
+node server/index.mjs          # Console API，http://127.0.0.1:4174
+cd web-console && npm run dev  # Vite，http://127.0.0.1:4173，/api 代理到 4174
+```
+
+生产式本地运行（同源）：
+
+```bash
+cd web-console && npm run build
+node server/index.mjs          # 同时托管 web-console/dist/
+```
+
+常用参数：`--host 127.0.0.1 --port 4174 --no-static`。
+
+页面默认读取真实 API；设置 `VITE_DATA_SOURCE=mock` 可切换到内置演示数据（用于离线开发与视觉验证）。顶栏会显示 Agent 健康状态、命令积压和 dry-run 标识；Agent 未运行时任务保持"待执行"，页面会如实显示等待原因，不会假装已开始联系同事。
 
 ## 从 dry-run 切换到真实发送
 

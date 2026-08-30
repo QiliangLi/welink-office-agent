@@ -45,40 +45,42 @@ Do not recreate tasks that already exist.
 
 ### `tick`
 
-Perform exactly one bounded processing cycle:
+Perform exactly one bounded processing cycle. Start from the persisted command inbox, then move to messages:
 
 1. Run `resume`.
-2. Read the control group ID and all participants in unfinished tasks.
-3. Query the control group and relevant user/group histories, using saved cursors where available.
-4. Ignore messages containing `[WELINK_AGENT_MESSAGE` as Agent-authored messages.
-5. For each new human message:
-   - write it with `record-message` before reasoning about it;
-   - associate it with an existing task/subtask when reasonably clear;
+2. Run `tick` (the wrapper command). It deterministically consumes queued console commands: it executes approval sends, reminders and recovery bookkeeping itself, and returns `assignments` — planning/instruction/decision work that needs your reasoning. For each assignment, do the reasoning, record results with `add-subtask`/`send-user`/`update-subtask`, then close the command with `complete-command --command-id <id> --status succeeded` (or `failed` with `--error-code`/`--error-message`).
+3. Read the control group ID and all participants in unfinished tasks.
+4. Query the control group and relevant user/group histories, using saved cursors where available.
+5. Ignore messages containing `[WELINK_AGENT_MESSAGE` as Agent-authored messages.
+6. For each new human message:
+   - write it with `record-message` before reasoning about it; the wrapper attributes the reply to a conversation (explicit reply/thread id first, then the unique active conversation). If it reports `unresolved_multiple` or `unattributed`, do not advance any task — ask the owner or create a recovery item;
    - extract facts, missing information, conflicts, and newly created work items;
    - create every discovered item with `add-item` before classifying it;
    - update the cursor only after the message has been recorded and processed.
-6. For a light item that is necessary for the parent task, classify it as `auto_subtask`, add the required information, and contact the configured colleague.
-7. For a larger item, scope extension, ambiguous message, unsupported image/file/rich media, missing contact, or unclear task association:
+7. For a light item that is necessary for the parent task, classify it as `auto_subtask`, add the required information, and contact the configured colleague.
+8. For a larger item, scope extension, ambiguous message, unsupported image/file/rich media, missing contact, or unclear task association:
    - classify/create an owner approval;
    - send one structured request to the configured control group;
    - pause only the affected subtask, not unrelated work.
-8. Resolve control-group instructions such as approval, rejection, return, close, pause, resume, status, and retry.
-9. Continue due follow-ups, but do not exceed the configured reminder count.
-10. Update task working summaries and complete a task only when the wrapper's `complete-task` check passes.
-11. Report only what changed during this tick.
+9. Resolve control-group instructions such as approval, rejection, return, close, pause, resume, status, and retry.
+10. Continue due follow-ups from `due_followups`, but do not exceed the configured reminder count. When a conversation is finished (reply processed, subtask completed or closed), run `close-conversation --conversation-id <id>` so the next queued task for that contact can proceed.
+11. Update task working summaries and complete a task only when the wrapper's `complete-task` check passes.
+12. Report only what changed during this tick.
+
+The contact-slot rule is enforced by the wrapper: a second task contacting the same person returns `queued` instead of sending. Never work around it by calling `welink-cli` directly.
 
 ### Any other request: create a new task
 
-Treat the invocation arguments or current user request as the owner's task request.
+Treat the invocation arguments or current user request as the owner's task request. Requests that arrived through the Web console already exist as `queued` task snapshots plus a `task.create` command; the tick's `plan_task` assignment hands them to you — do not create them again.
 
-1. Run `create-task` with the full request.
+1. Run `create-task` with the full request (add `--status queued` when you only want to persist it for later planning).
 2. Decompose the goal into the smallest useful information-gathering subtasks.
 3. Resolve each topic using this priority:
    - employee explicitly named in the current request;
    - `routing.json`;
    - expertise in `contacts.json`.
 4. Create subtasks with `add-subtask`; include required information that determines completion.
-5. Send concise questions to the selected colleagues with `send-user`.
+5. Send concise questions to the selected colleagues with `send-user`. If the reply reports `queued: true`, the subtask is waiting for the contact slot — move on to other work.
 6. Send a task-created summary to the control group with `send-group`.
 7. Return the task ID and current dry-run/live mode.
 

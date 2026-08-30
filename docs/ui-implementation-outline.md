@@ -1,3 +1,5 @@
+> **状态说明（2026-08-30）**：本文是最初的产品意图/路线笔记，描述到 mock 原型为止。UI 已按 `docs/frontend-backend-integration.md` 接入真实 Console API；当前实现约束以 `docs/agent-guides/web-console.md` 为准。
+
 最合适的方式不是“把 PNG 一键转成 HTML”，而是把这些 UI 图当作**视觉规格图**，让 Codex 按页面逐步重建。这样代码结构、响应式、状态交互都会比截图转代码干净很多。
 
 我建议你走下面这条路线。

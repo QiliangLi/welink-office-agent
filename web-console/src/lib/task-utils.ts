@@ -1,7 +1,7 @@
-import type { Task, TaskStatus } from "../types/domain";
+import type { DisplayStatus, TaskDto } from "../types/domain";
 
 export const STATUS_META: Record<
-  TaskStatus,
+  DisplayStatus,
   { label: string; shortLabel: string; tone: "neutral" | "primary" | "success" | "warning" | "danger" | "info" }
 > = {
   queued: { label: "待执行", shortLabel: "待执行", tone: "neutral" },
@@ -17,33 +17,39 @@ export const STATUS_META: Record<
 
 export type TaskTimeFilter = "all" | "today" | "week";
 
-export function filterTasks(tasks: Task[], query: string, status: TaskStatus | "all", time: TaskTimeFilter) {
+/**
+ * Local instant filtering on top of the server query. The server remains
+ * the authority — the same filters are mirrored into the URL and the API
+ * request (docs/frontend-backend-integration.md §7.4).
+ */
+export function filterTasks(tasks: TaskDto[], query: string, status: DisplayStatus | "all", time: TaskTimeFilter) {
   const normalized = query.trim().toLocaleLowerCase("zh-CN");
-  const base = Date.parse("2026-08-30T23:59:59+08:00");
-  const cutoff = time === "today" ? base - 24 * 60 * 60 * 1000 : time === "week" ? base - 7 * 24 * 60 * 60 * 1000 : 0;
+  const now = Date.now();
+  const cutoff = time === "today" ? now - 24 * 60 * 60 * 1000 : time === "week" ? now - 7 * 24 * 60 * 60 * 1000 : 0;
 
   return tasks.filter((task) => {
     const matchesQuery =
       !normalized ||
-      [task.title, task.id, task.createdBy.name, task.description]
+      [task.title, task.id, task.createdBy?.name ?? "", task.description]
         .join(" ")
         .toLocaleLowerCase("zh-CN")
         .includes(normalized);
-    const matchesStatus = status === "all" || task.status === status;
+    const matchesStatus = status === "all" || task.displayStatus === status;
     const matchesTime = time === "all" || Date.parse(task.updatedAt) >= cutoff;
     return matchesQuery && matchesStatus && matchesTime;
   });
 }
 
 export function relativeTime(iso: string) {
-  const now = Date.parse("2026-08-30T12:00:00+08:00");
-  const diff = Math.max(0, now - Date.parse(iso));
+  const diff = Math.max(0, Date.now() - Date.parse(iso));
   const minutes = Math.floor(diff / 60_000);
   if (minutes < 1) return "刚刚";
   if (minutes < 60) return `${minutes} 分钟前`;
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return `${hours} 小时前`;
-  return `${Math.floor(hours / 24)} 天前`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days} 天前`;
+  return new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit" }).format(new Date(iso));
 }
 
 export function formatDateTime(iso: string) {

@@ -5,11 +5,11 @@
 ## 技术与目录
 
 - 使用 React、TypeScript、Vite、React Router、Tailwind CSS、CSS variables 和 Lucide React。
-- 依赖保持精简；共享 server state 真正接入前不要增加全局状态库。
-- 当前控制台使用 mock DTO；不得直接读取 `runtime/`。接入 API/SSE 时遵循 `docs/frontend-backend-integration.md`。
-- 页面位于 `web-console/src/pages/`，共享 shell 位于 `components/shell/` 和 `layouts/`，领域组件位于 `components/`，类型位于 `types/`，mock 位于 `mocks/`，小型展示辅助位于 `lib/`。
+- 依赖保持精简；共享 server state 使用自建查询层（`src/queries/`），不引入全局状态库或 react-query。
+- 控制台默认通过 Console API（`/api/v1`，见 `server/`）读写真实数据；`VITE_DATA_SOURCE=mock` 时切换到 `src/mocks/mock-client.ts`。任何模式下都不得直接读取 `runtime/` 或 `config/`。数据契约以 `server/schemas/` 为源，镜像在 `web-console/src/api/contracts.ts`，两端必须同步修改。
+- 页面位于 `web-console/src/pages/`，共享 shell 位于 `components/shell/` 和 `layouts/`，领域组件位于 `components/`，类型镜像位于 `types/`（re-export `api/contracts.ts`），mock 位于 `mocks/`，小型展示辅助位于 `lib/`。
 - 只在组件确实共享或由数据驱动时抽取，避免单体页面，也避免一个 wrapper 一个文件。
-- 所有页面共用 `Task`、`TaskStatus`、`Approval`、`PlanStep` 和 `ActivityEvent` 类型；不要在 JSX 中硬编码完整任务树。
+- 页面渲染的 `Task.displayStatus`、`currentAction`、`waitingReason`、进度和 `allowedCommands` 全部来自服务端 DTO；前端不得自行推导状态或解析自然语言等待原因。SSE 事件只触发查询失效，不在浏览器复刻 runtime 状态机。
 
 ## 路由
 
@@ -37,12 +37,13 @@
 ## 产品行为
 
 - 页面持续回答：Agent 正在做什么、为什么这样做、哪里需要人工、如何暂停或继续。
-- `queued` 是独立“待执行”状态；Overview 必须把当前任务和待执行队列拆开。
-- running 任务必须显式显示暂停/停止入口，不能藏进 overflow。
-- 审批卡必须展示动作、影响、证据/原因以及批准、编辑、拒绝操作。
+- `queued` 是独立“待执行”状态；Overview 必须把当前任务和待执行队列拆开（`currentTasks`/`queuedTasks` 来自 `/overview` 的两个独立集合）。
+- running 任务必须显式显示暂停/停止入口，不能藏进 overflow；详情页按钮集合来自服务端 `allowedCommands`。
+- 审批卡必须展示动作、影响、原因以及与 payload 类型匹配的操作（消息批准/编辑/拒绝、日程与范围变更选择选项、澄清提交回答）；只传状态不给 payload 的决定视为无效。
 - partial、stopped、failed、waiting external、waiting approval 和 queued 是不同状态。
-- 任务计划必须数据驱动，展示父子步骤、当前步骤、完成项、等待原因和时间戳。
-- 新建任务需要可访问的 label/校验、本地草稿、进阶选项说明，以及说明后果的创建确认。
+- 任务计划必须数据驱动，展示当前步骤、完成项、等待原因和时间戳；不确定的发送结果显示“待核实”，不显示“已发送”。
+- 新建任务需要可访问的 label/校验、本地草稿、进阶选项说明，以及说明后果的创建确认；附件能力为 false 时隐藏上传入口并说明尚未接入。
+- 健康与 SSE：顶栏健康状态、dry-run 标识和命令积压来自 `/health`；API 不可用时保留最近数据并显示横幅，不把任务清空。
 
 ## 无障碍与响应式
 

@@ -1,5 +1,7 @@
 # WeLink Office Agent UI 详细实现规格
 
+> **状态说明（2026-08-30）**：本文描述的是第一阶段的 mock UI 原型规格（`VITE_DATA_SOURCE=mock` 仍保留该形态用于离线开发与视觉验证）。当前默认实现已接入 Console API 与 SSE：数据契约见 `web-console/src/api/contracts.ts`，状态语义以服务端 `displayStatus`/`allowedCommands` 为准，行为约束见 `docs/agent-guides/web-console.md` 与 `docs/frontend-backend-integration.md`。本文中与“固定 mock 时间”“mock 数据计算”等相关的条目仅适用于 mock 模式。
+
 ## 1. 文档目标
 
 本文把 `ui-implementation-outline.md` 和 `docs/design-reference/` 中的五张概念图转换成可直接执行的工程规格。

@@ -3,6 +3,8 @@
     "name": "张三",
     "address": "张哥",
     "w3account": "z00123456",
+    "department": "测试部",
+    "avatar_initials": "ZS",
     "expertise": ["性能测试", "benchmark", "测试环境"],
     "auto_contact": true,
     "auto_reply": true
@@ -11,6 +13,8 @@
     "name": "李四",
     "address": "李工",
     "w3account": "l00678901",
+    "department": "网络部",
+    "avatar_initials": "LS",
     "expertise": ["跨域网络", "带宽", "丢包", "DPU"],
     "auto_contact": true,
     "auto_reply": true

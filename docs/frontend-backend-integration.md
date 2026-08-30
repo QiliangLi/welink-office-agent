@@ -1,5 +1,7 @@
 # WeLink Office Agent 前后端对接设计
 
+> **实现状态（2026-08-30）**：本文的推荐架构已按第 14 节的顺序落地——阶段一（只读真实数据）、阶段二（revision/文件锁/命令队列）、阶段三（tick 消费命令、联系人沟通槽、回复归属、completion policy 统一检查）、阶段四（SSE + heartbeat + snapshot.required）均已实现并有测试覆盖（`test/`、`server/`、`scripts/lib/`、`web-console/src/api/`）。阶段五（附件与产物）与第 16 节列出的内容保持“明确不做”，相关能力开关为 false。OpenAPI/contracts 自动生成仍为 proposed：契约目前以 `server/schemas/` 为源，手工镜像在 `web-console/src/api/contracts.ts`。
+
 ## 1. 文档用途
 
 本文给出 `web-console/` 与现有 WeLink Agent runtime 的完整对接方案。目标是让页面展示真实任务、审批、计划和活动记录，并让创建任务、暂停、继续、取消、审批、补充信息、催办和追加指令能够可靠地进入 Agent 执行流程。
@@ -1046,7 +1048,9 @@ mock 数据保留给 Storybook、视觉回归或测试，不再作为生产 Prov
 
 ## 14. 实施顺序
 
-### 阶段一 只读真实数据
+> 以下阶段一至四已实现（含测试），阶段五仍未实现。与原设计的差异：SSE 的 JSONL offset cursor 与 `snapshot.required` 已落地；OpenAPI 自动生成仍是后续工作。
+
+### 阶段一 只读真实数据（已实现）
 
 1. 给 Store 增加读取 JSONL、按 ID 查关联记录和安全容错。
 2. 实现 task、approval 和 overview serializer。
@@ -1056,7 +1060,7 @@ mock 数据保留给 Storybook、视觉回归或测试，不再作为生产 Prov
 
 完成标准是页面不再依赖 `initialTasks` 和 `initialApprovals`，刷新后仍能读到已保存数据。
 
-### 阶段二 状态写入和并发保护
+### 阶段二 状态写入和并发保护（已实现）
 
 1. 给所有快照增加 revision。
 2. 实现文件锁和 `mutate*` 方法。
@@ -1066,7 +1070,7 @@ mock 数据保留给 Storybook、视觉回归或测试，不再作为生产 Prov
 
 完成标准是连续双击、刷新重试和 API/Skill 同时修改时不会重复创建或覆盖状态。
 
-### 阶段三 Agent 命令消费
+### 阶段三 Agent 命令消费（已实现）
 
 1. `tick` 在查询消息前领取 UI 命令。
 2. 接入 task.create、task.instruction、subtask.remind 和 approval.apply。
@@ -1078,7 +1082,7 @@ mock 数据保留给 Storybook、视觉回归或测试，不再作为生产 Prov
 
 完成标准是从页面创建任务后，Agent 能完成拆解、联系和状态回写；审批后能看到 action 的真实结果。
 
-### 阶段四 实时更新
+### 阶段四 实时更新（已实现）
 
 1. 实现 JSONL tail cursor。
 2. 实现 SSE 和 heartbeat。
@@ -1087,7 +1091,7 @@ mock 数据保留给 Storybook、视觉回归或测试，不再作为生产 Prov
 
 完成标准是 Agent 在命令行或下一轮 tick 更新任务后，页面无需手动刷新即可变化。
 
-### 阶段五 附件和产物
+### 阶段五 附件和产物（未实现）
 
 附件需要单独设计上传暂存、大小限制、MIME 校验、哈希、病毒扫描策略和生命周期。runtime 能实际读取附件以前，页面保持 capability false。
 

@@ -1,11 +1,14 @@
 #!/usr/bin/env node
-import fs from 'node:fs/promises';
 import path from 'node:path';
+import { CommandService } from './lib/commands.mjs';
+import { ApprovalService } from './lib/approval-service.mjs';
+import { MessageService } from './lib/message-service.mjs';
+import { SendService } from './lib/send-service.mjs';
 import { Store } from './lib/store.mjs';
-import { hashText, makeId } from './lib/ids.mjs';
+import { TaskService } from './lib/task-service.mjs';
+import { makeId } from './lib/ids.mjs';
 import {
   boolArg,
-  compactText,
   jsonOutput,
   nowIso,
   parseArgs,
@@ -15,9 +18,15 @@ import {
   splitList
 } from './lib/utils.mjs';
 import { runWelink } from './lib/welink.mjs';
+import { releaseContactSlot } from './lib/contact-slots.mjs';
 
 const rootDir = projectRootFromScript(import.meta.url);
 const store = new Store(rootDir);
+const commands = new CommandService(store);
+const taskService = new TaskService(store, commands);
+const approvalService = new ApprovalService(store, commands);
+const sendService = new SendService(store);
+const messageService = new MessageService(store);
 const [command = 'help', ...rest] = process.argv.slice(2);
 const args = parseArgs(rest);
 
@@ -27,24 +36,28 @@ function usage() {
     commands: {
       init: '初始化 config/*.json 和 runtime 目录',
       preflight: '检查 welink-cli 认证状态',
-      'create-task': '--request <任务描述> [--title <标题>]',
+      'create-task': '--request <任务描述> [--title <标题>] [--status queued|running] [--priority high|normal|low] [--deadline <ISO>] [--external-policy ...] [--execution-mode ...] [--created-by <工号>] [--source skill|web_console]',
       'add-subtask': '--task-id <ID> --title <标题> --target-employee-number <工号> [--required-info a,b] [--dynamic true]',
-      'update-subtask': '--task-id <ID> --subtask-id <ID> [--status <状态>] [--summary <摘要>] [--collected-file <json>] [--missing-info a,b]',
+      'update-subtask': '--task-id <ID> --subtask-id <ID> [--status <状态>] [--summary <摘要>] [--collected-file <json>] [--missing-info a,b] [--next-action <类型>]',
       'add-item': '--task-id <ID> --description <事项> [--source-message-id <ID>] [--source-employee-number <工号>] [--relation required_dependency|scope_extension] [--workload light|large|unknown]',
       'classify-item': '--item-id <ID> --decision auto_subtask|owner_approval|ignore|independent [其他参数]',
       'create-approval': '--task-id <ID> --question <问题> [--item-id <ID>] [--options a,b,c] [--proposed-action-file <json>]',
       'resolve-approval': '--approval-id <ID> --resolution approved|rejected|returned|closed|modified [--response <文本>]',
-      'record-message': '--direction inbound|outbound --participant-type user|group --participant-id <工号或群号> --content <文本> [--task-id <ID>] [--subtask-id <ID>] [--external-message-id <ID>]',
+      'record-message': '--direction inbound|outbound --participant-type user|group --participant-id <工号或群号> --content <文本> [--task-id <ID>] [--subtask-id <ID>] [--external-message-id <ID>] [--reply-to-action-id <ID>] [--external-thread-id <ID>]',
       'set-cursor': '--participant-type user|group --participant-id <工号或群号> --message-id <ID> [--message-time <ISO>]',
       'update-task': '--task-id <ID> [--status <状态>] [--working-summary-file <json>]',
+      'add-instruction': '--task-id <ID> --text <追加指令>',
       'send-user': '--employee-number <工号> --text <消息> [--task-id <ID>] [--subtask-id <ID>] [--type <类型>]',
       'send-group': '--group-id <群号> --text <消息> [--task-id <ID>] [--approval-id <ID>] [--type <类型>]',
       'query-history-user': '--employee-number <工号> [--count 20] [--message-id <ID>] [--direction 1]',
       'query-history-group': '--group-id <群号> [--count 20] [--message-id <ID>] [--direction 1]',
       'query-recent': '[--count 20]',
+      tick: '[--max-commands 10] 消费 UI 命令队列并输出待 Agent 推理的分配',
+      'complete-command': '--command-id <ID> [--status succeeded|failed] [--error-code <CODE>] [--error-message <文本>]',
+      'close-conversation': '--conversation-id <ID> [--reason <原因>] 释放联系人沟通槽并唤醒下一项',
       status: '[--task-id <ID>]',
       resume: '输出所有未完成任务、待确认事项和不确定动作',
-      'complete-task': '--task-id <ID> [--summary <文本>]',
+      'complete-task': '--task-id <ID> [--summary <文本>] [--force true]',
       help: '显示帮助'
     }
   };
@@ -60,125 +73,279 @@ function findSubtask(task, subtaskId) {
   return subtask;
 }
 
-async function createSubtask(task, input) {
-  const subtask = {
-    subtask_id: makeId('SUB'),
-    title: input.title,
-    topic: input.topic ?? null,
-    target_employee_number: input.target_employee_number ?? null,
-    target_group_id: input.target_group_id ?? null,
-    required: input.required ?? true,
-    status: input.status ?? 'ready_to_contact',
-    required_information: input.required_information ?? [],
-    collected_information: {},
-    missing_information: input.required_information ?? [],
-    summary: null,
-    created_dynamically: input.created_dynamically ?? false,
-    created_from_item_id: input.created_from_item_id ?? null,
-    created_at: nowIso(),
-    updated_at: nowIso(),
-    communication: {
-      round: 0,
-      first_contact_at: null,
-      last_contact_at: null,
-      last_reply_at: null,
-      reminder_count: 0,
-      next_reminder_at: null
-    },
-    next_action: null
+/**
+ * One deterministic tick: recover interrupted work, consume the persisted
+ * command inbox, and hand reasoning work back to the host Agent. WeLink
+ * queries stay in the host loop; this command never blocks on the CLI.
+ */
+async function runTick() {
+  await ensureInitialized();
+  const maxCommands = Math.max(1, Number(args['max-commands'] ?? 10) || 10);
+
+  const state = await store.loadState();
+  state.last_started_tick = nowIso();
+  state.status = 'ticking';
+  await store.saveState(state);
+
+  const recoveredLeases = await commands.recoverExpiredLeases();
+
+  // Actions stuck in executing (crash between pre-persist and completion)
+  // become unknown; verification is a host-Agent assignment, never a resend.
+  const STALE_EXECUTING_MS = 15 * 60_000;
+  const recoveredActions = [];
+  for (const action of await store.listActions()) {
+    if (action.status !== 'executing') continue;
+    const started = Date.parse(action.created_at);
+    if (!Number.isFinite(started) || Date.now() - started <= STALE_EXECUTING_MS) continue;
+    action.status = 'unknown';
+    action.completed_at = nowIso();
+    await store.saveAction(action);
+    await store.logEvent('action_marked_unknown', { action_id: action.action_id, task_id: action.task_id });
+    recoveredActions.push(action.action_id);
+  }
+  const uncertainActions = (await store.listActions()).filter((action) => ['executing', 'unknown'].includes(action.status));
+
+  const assignments = [];
+  const executed = [];
+  const skipCommandIds = new Set();
+  const tasksCache = new Map();
+  const loadTaskCached = async (taskId, refresh = false) => {
+    if (refresh || !tasksCache.has(taskId)) tasksCache.set(taskId, await store.loadTask(taskId));
+    return tasksCache.get(taskId);
   };
-  task.subtasks.push(subtask);
-  await store.saveTask(task);
-  await store.logEvent('subtask_created', {
-    task_id: task.task_id,
-    subtask_id: subtask.subtask_id,
-    dynamic: subtask.created_dynamically,
-    target_employee_number: subtask.target_employee_number
-  });
-  return subtask;
-}
 
-function agentSuffix(policies, metadata = {}) {
-  const meta = Object.entries(metadata)
-    .filter(([, value]) => value !== undefined && value !== null && value !== '')
-    .map(([key, value]) => `${key}=${String(value).replace(/\s+/g, '_')}`)
-    .join(' ');
-  const marker = meta
-    ? policies.agent_marker.replace(/\]$/, ` ${meta}]`)
-    : policies.agent_marker;
-  return `${policies.agent_footer_text}\n${marker}`;
-}
+  for (let index = 0; index < maxCommands; index += 1) {
+    const claimed = await commands.claimNext({ workerId: `tick:${process.pid}`, skipCommandIds: [...skipCommandIds] });
+    if (!claimed) break;
 
-function withAgentFooter(text, policies, metadata) {
-  const trimmed = String(text).trim();
-  if (trimmed.includes('[WELINK_AGENT_MESSAGE')) return trimmed;
-  return `${trimmed}\n\n${agentSuffix(policies, metadata)}`;
-}
+    let taskId = claimed.aggregate_type === 'task' ? claimed.aggregate_id : claimed.payload?.task_id ?? null;
+    if (claimed.type === 'approval.apply') {
+      const approval = await store.loadApproval(claimed.aggregate_id);
+      taskId = approval.task_id;
+    }
+    const task = taskId ? await loadTaskCached(taskId) : null;
+    if (task && ['paused', 'cancelled', 'completed', 'failed'].includes(task.status)) {
+      // Leave queued for after the owner resumes (or cancel removes it).
+      skipCommandIds.add(claimed.command_id);
+      await commands.releaseClaim(claimed.command_id);
+      continue;
+    }
 
-async function executeSend({ actionType, targetType, targetId, cliArgs, content, taskId, subtaskId, approvalId, messageType }) {
+    if (claimed.type === 'task.create') {
+      await commands.markWaitingAgent(claimed.command_id);
+      assignments.push({
+        kind: 'plan_task',
+        command_id: claimed.command_id,
+        task_id: claimed.aggregate_id,
+        description: task.original_request,
+        priority: task.priority
+      });
+      continue;
+    }
+
+    if (claimed.type === 'task.instruction') {
+      await commands.markWaitingAgent(claimed.command_id);
+      assignments.push({ kind: 'handle_instruction', command_id: claimed.command_id, task_id: claimed.aggregate_id, text: claimed.payload.text });
+      continue;
+    }
+
+    if (claimed.type === 'task.resume') {
+      await commands.markWaitingAgent(claimed.command_id);
+      assignments.push({ kind: 'resume_task', command_id: claimed.command_id, task_id: claimed.aggregate_id });
+      continue;
+    }
+
+    if (claimed.type === 'task.cancel') {
+      await commands.markWaitingAgent(claimed.command_id);
+      assignments.push({ kind: 'cancel_task', command_id: claimed.command_id, task_id: claimed.aggregate_id });
+      continue;
+    }
+
+    if (claimed.type === 'task.retry') {
+      await commands.markWaitingAgent(claimed.command_id);
+      assignments.push({ kind: 'retry_task', command_id: claimed.command_id, task_id: claimed.aggregate_id });
+      continue;
+    }
+
+    if (claimed.type === 'approval.apply') {
+      const approval = await store.loadApproval(claimed.aggregate_id);
+      const payload = approval.decision_payload ?? {};
+      const proposedAction = approval.proposed_action;
+      if (approval.status === 'approved' && proposedAction?.type === 'send_message' && !payload.edited_content) {
+        let sendOutcome;
+        try {
+          sendOutcome = proposedAction.target_type === 'group'
+            ? { queued: false, ...(await sendService.sendGroup({
+                groupId: proposedAction.target_id,
+                text: proposedAction.content,
+                taskId: approval.task_id,
+                subtaskId: approval.subtask_id,
+                approvalId: approval.approval_id,
+                type: 'approval'
+              })) }
+            : { queued: false, ...(await sendService.sendUser({
+                employeeNumber: proposedAction.target_id,
+                text: proposedAction.content,
+                taskId: approval.task_id,
+                subtaskId: approval.subtask_id,
+                type: 'approval'
+              })) };
+        } catch (error) {
+          sendOutcome = { error };
+        }
+
+        if (sendOutcome.error) {
+          await commands.complete(claimed.command_id, {
+            status: 'failed',
+            error: { code: sendOutcome.error.code ?? 'SEND_FAILED', message: sendOutcome.error.message }
+          });
+          executed.push({ command_id: claimed.command_id, status: 'failed', error: sendOutcome.error.code ?? 'SEND_FAILED' });
+          continue;
+        }
+        if (sendOutcome.queued) {
+          if (claimed.attempts >= 5) {
+            await commands.complete(claimed.command_id, {
+              status: 'failed',
+              error: { code: 'CONTACT_SLOT_QUEUED', message: '联系人沟通槽被占用，请稍后重试。', retryable: true }
+            });
+            executed.push({ command_id: claimed.command_id, status: 'failed', error: 'CONTACT_SLOT_QUEUED' });
+          } else {
+            await commands.releaseClaim(claimed.command_id);
+            skipCommandIds.add(claimed.command_id);
+          }
+          continue;
+        }
+        const actionStatus = sendOutcome.action.status;
+        if (actionStatus === 'succeeded' || actionStatus === 'dry_run') {
+          await commands.complete(claimed.command_id, { status: 'succeeded' });
+          executed.push({ command_id: claimed.command_id, status: 'succeeded', action_id: sendOutcome.action.action_id, action_status: actionStatus });
+        } else if (actionStatus === 'unknown') {
+          await commands.complete(claimed.command_id, {
+            status: 'failed',
+            error: { code: 'ACTION_UNKNOWN', message: '发送结果未知，需要先查询会话历史核实。', action_id: sendOutcome.action.action_id }
+          });
+          executed.push({ command_id: claimed.command_id, status: 'failed', error: 'ACTION_UNKNOWN' });
+        } else {
+          await commands.complete(claimed.command_id, {
+            status: 'failed',
+            error: { code: 'SEND_FAILED', message: '发送失败，可核实后重试。', action_id: sendOutcome.action.action_id }
+          });
+          executed.push({ command_id: claimed.command_id, status: 'failed', error: 'SEND_FAILED' });
+        }
+        continue;
+      }
+      await commands.markWaitingAgent(claimed.command_id);
+      assignments.push({
+        kind: 'apply_decision',
+        command_id: claimed.command_id,
+        approval_id: approval.approval_id,
+        task_id: approval.task_id,
+        subtask_id: approval.subtask_id,
+        decision_payload: payload,
+        proposed_action: proposedAction
+      });
+      continue;
+    }
+
+    if (claimed.type === 'subtask.remind') {
+      const policies = await store.loadConfig('policies');
+      const reminder = policies.follow_up ?? {};
+      const maxReminders = reminder.max_reminders ?? 2;
+      const subtaskId = claimed.payload.subtask_id;
+      const subtask = findSubtask(task, subtaskId);
+      if (subtask.status !== 'waiting_reply') {
+        await commands.complete(claimed.command_id, {
+          status: 'failed',
+          error: { code: 'INVALID_STATE', message: '子任务不在等待回复状态，不能催办。' }
+        });
+        executed.push({ command_id: claimed.command_id, status: 'failed', error: 'INVALID_STATE' });
+        continue;
+      }
+      if (subtask.communication.reminder_count >= maxReminders) {
+        await commands.complete(claimed.command_id, {
+          status: 'failed',
+          error: { code: 'REMINDER_LIMIT_REACHED', message: '已达到该子任务的催办上限。' }
+        });
+        executed.push({ command_id: claimed.command_id, status: 'failed', error: 'REMINDER_LIMIT_REACHED' });
+        continue;
+      }
+      const missing = (subtask.missing_information ?? []).join('、');
+      const text = `提醒：关于「${subtask.title}」，${missing ? `还需要这些信息：${missing}。` : '麻烦按之前的请求回复一下。'}方便时同步即可，谢谢！`;
+      const outcome = await sendService.sendUser({
+        employeeNumber: subtask.target_employee_number,
+        text,
+        taskId: task.task_id,
+        subtaskId,
+        type: 'reminder'
+      });
+      if (outcome.queued) {
+        await commands.complete(claimed.command_id, {
+          status: 'failed',
+          error: { code: 'CONTACT_SLOT_QUEUED', message: '联系人沟通槽被占用，催办未发送。', retryable: true, position: outcome.position }
+        });
+        executed.push({ command_id: claimed.command_id, status: 'failed', error: 'CONTACT_SLOT_QUEUED' });
+        continue;
+      }
+      const updatedTask = await loadTaskCached(task.task_id, true);
+      const fresh = findSubtask(updatedTask, subtaskId);
+      fresh.communication.reminder_count += 1;
+      const intervalMs = (reminder.reminder_interval_hours ?? 4) * 3_600_000;
+      fresh.communication.next_reminder_at = new Date(Date.now() + intervalMs).toISOString();
+      await store.saveTask(updatedTask);
+      await commands.complete(claimed.command_id, { status: 'succeeded' });
+      executed.push({ command_id: claimed.command_id, status: 'succeeded', action_id: outcome.action.action_id, action_status: outcome.action.status });
+      continue;
+    }
+
+    await commands.complete(claimed.command_id, {
+      status: 'failed',
+      error: { code: 'UNSUPPORTED_COMMAND', message: `tick 不支持处理命令类型：${claimed.type}` }
+    });
+  }
+
+  // Deterministic follow-up scan for the host Agent (it drafts the text).
+  const dueFollowups = [];
+  const tasks = await store.listTasks();
   const policies = await store.loadConfig('policies');
-  const actionId = makeId('ACT');
-  const action = {
-    action_id: actionId,
-    task_id: taskId ?? null,
-    subtask_id: subtaskId ?? null,
-    approval_id: approvalId ?? null,
-    type: actionType,
-    target_type: targetType,
-    target_id: targetId,
-    content,
-    content_hash: hashText(content),
-    status: 'executing',
-    created_at: nowIso(),
-    updated_at: nowIso()
-  };
-  await store.saveAction(action);
-  await store.logEvent('action_started', {
-    action_id: actionId,
-    task_id: taskId ?? null,
-    action_type: actionType,
-    target_id: targetId
-  });
-
-  const result = await runWelink(cliArgs, { dryRun: policies.dry_run === true });
-  action.external_result = result;
-  action.status = result.ok ? (result.dry_run ? 'dry_run' : 'succeeded') : (result.timed_out ? 'unknown' : 'failed');
-  action.completed_at = nowIso();
-  await store.saveAction(action);
-
-  await store.logMessage({
-    direction: 'outbound',
-    participant_type: targetType,
-    participant_id: targetId,
-    task_id: taskId ?? null,
-    subtask_id: subtaskId ?? null,
-    approval_id: approvalId ?? null,
-    message_type: messageType ?? 'message',
-    content,
-    action_id: actionId,
-    status: action.status,
-    raw_result: result
-  });
-  await store.logEvent('action_finished', {
-    action_id: actionId,
-    task_id: taskId ?? null,
-    status: action.status
-  });
-
-  if (taskId && subtaskId) {
-    const task = await store.loadTask(taskId);
-    const subtask = findSubtask(task, subtaskId);
-    if (result.ok) {
-      subtask.status = 'waiting_reply';
-      subtask.communication.round += 1;
-      subtask.communication.first_contact_at ??= nowIso();
-      subtask.communication.last_contact_at = nowIso();
-      subtask.next_action = { type: 'wait_reply' };
-      await store.saveTask(task);
+  const maxReminders = policies.follow_up?.max_reminders ?? 2;
+  const now = Date.now();
+  for (const entry of tasks) {
+    if (['completed', 'cancelled', 'failed', 'paused'].includes(entry.status)) continue;
+    for (const subtask of entry.subtasks ?? []) {
+      if (subtask.status !== 'waiting_reply') continue;
+      if ((subtask.communication?.reminder_count ?? 0) >= maxReminders) continue;
+      const due = subtask.communication?.next_reminder_at ? Date.parse(subtask.communication.next_reminder_at) : null;
+      if (due === null || Number.isNaN(due) || due > now) continue;
+      dueFollowups.push({
+        task_id: entry.task_id,
+        subtask_id: subtask.subtask_id,
+        title: subtask.title,
+        target_employee_number: subtask.target_employee_number,
+        reminder_count: subtask.communication.reminder_count,
+        next_reminder_at: subtask.communication.next_reminder_at
+      });
     }
   }
 
-  return { action, result };
+  const finalState = await store.loadState();
+  finalState.last_successful_tick = nowIso();
+  finalState.status = 'idle';
+  await store.saveState(finalState);
+
+  return {
+    ok: true,
+    recovered_leases: recoveredLeases,
+    recovered_actions: recoveredActions,
+    uncertain_actions: uncertainActions.map((action) => ({
+      action_id: action.action_id,
+      task_id: action.task_id,
+      status: action.status
+    })),
+    assignments,
+    executed,
+    due_followups: dueFollowups,
+    next: '恢复不确定动作，处理 assignments（规划/指令/审批后续），再查询 WeLink 新消息。'
+  };
 }
 
 async function main() {
@@ -205,41 +372,19 @@ async function main() {
     case 'create-task': {
       await ensureInitialized();
       const request = requireArg(args, 'request');
-      const taskId = makeId('TASK');
-      const task = {
-        schema_version: 1,
-        task_id: taskId,
-        title: args.title || compactText(request, 50),
-        original_request: request,
-        status: 'running',
-        created_at: nowIso(),
-        updated_at: nowIso(),
-        completion_policy: {
-          require_all_mandatory_subtasks: true,
-          require_no_open_items: true,
-          require_no_pending_approvals: true,
-          require_no_unresolved_conflicts: true,
-          require_no_waiting_replies: true,
-          require_no_uncertain_actions: true
-        },
-        subtasks: [],
-        open_item_ids: [],
-        pending_approval_ids: [],
-        conflicts: [],
-        working_summary: {
-          confirmed_facts: [],
-          open_questions: [],
-          active_subtasks: [],
-          pending_approvals: [],
-          next_actions: []
-        },
-        final_summary: null
-      };
-      await store.saveTask(task);
-      const state = await store.loadState();
-      if (!state.active_task_ids.includes(taskId)) state.active_task_ids.push(taskId);
-      await store.saveState(state);
-      await store.logEvent('task_created', { task_id: taskId, original_request: request });
+      const task = await taskService.createTask({
+        request,
+        title: args.title,
+        status: args.status === 'queued' ? 'queued' : 'running',
+        createdBy: args['created-by'] ?? null,
+        source: args.source === 'web_console' ? 'web_console' : 'skill',
+        category: args.category ?? null,
+        priority: ['low', 'normal', 'high'].includes(args.priority) ? args.priority : 'normal',
+        deadlineAt: args.deadline ?? null,
+        externalPolicy: args['external-policy'] ?? 'balanced',
+        executionMode: args['execution-mode'] ?? 'automatic',
+        attachmentIds: []
+      });
       jsonOutput({ ok: true, task });
       return;
     }
@@ -247,8 +392,7 @@ async function main() {
     case 'add-subtask': {
       await ensureInitialized();
       const taskId = requireArg(args, 'task-id');
-      const task = await store.loadTask(taskId);
-      const subtask = await createSubtask(task, {
+      const subtask = await taskService.addSubtask(taskId, {
         title: requireArg(args, 'title'),
         topic: args.topic ?? null,
         target_employee_number: args['target-employee-number'] ?? null,
@@ -267,24 +411,18 @@ async function main() {
       await ensureInitialized();
       const taskId = requireArg(args, 'task-id');
       const subtaskId = requireArg(args, 'subtask-id');
-      const task = await store.loadTask(taskId);
-      const subtask = findSubtask(task, subtaskId);
-      if (args.status) subtask.status = args.status;
-      if (args.summary) subtask.summary = args.summary;
-      if (args['missing-info'] !== undefined) subtask.missing_information = splitList(args['missing-info']);
+      let collected;
       if (args['collected-file']) {
-        const collected = await readJsonFile(path.resolve(rootDir, args['collected-file']));
-        subtask.collected_information = { ...subtask.collected_information, ...collected };
+        collected = await readJsonFile(path.resolve(rootDir, args['collected-file']));
       }
-      if (args['reply-received']) {
-        subtask.communication.last_reply_at = nowIso();
-      }
-      if (args['next-action']) {
-        subtask.next_action = { type: args['next-action'] };
-      }
-      subtask.updated_at = nowIso();
-      await store.saveTask(task);
-      await store.logEvent('subtask_updated', { task_id: taskId, subtask_id: subtaskId, status: subtask.status });
+      const subtask = await taskService.updateSubtask(taskId, subtaskId, {
+        status: args.status,
+        summary: args.summary,
+        missing_information: args['missing-info'] !== undefined ? splitList(args['missing-info']) : undefined,
+        collected_information: collected,
+        next_action: args['next-action'] ? { type: args['next-action'] } : undefined,
+        reply_received: args['reply-received'] ? true : undefined
+      });
       jsonOutput({ ok: true, subtask });
       return;
     }
@@ -292,28 +430,35 @@ async function main() {
     case 'add-item': {
       await ensureInitialized();
       const taskId = requireArg(args, 'task-id');
-      const task = await store.loadTask(taskId);
-      const itemId = makeId('ITEM');
-      const item = {
-        item_id: itemId,
-        parent_task_id: taskId,
-        parent_subtask_id: args['parent-subtask-id'] ?? null,
-        source_message_id: args['source-message-id'] ?? null,
-        source_employee_number: args['source-employee-number'] ?? null,
-        description: requireArg(args, 'description'),
-        relation: args.relation ?? 'unknown',
-        workload: args.workload ?? 'unknown',
-        status: 'detected',
-        decision: null,
-        linked_subtask_id: null,
-        approval_id: null,
-        created_at: nowIso(),
-        updated_at: nowIso()
-      };
-      await store.saveItem(item);
-      if (!task.open_item_ids.includes(itemId)) task.open_item_ids.push(itemId);
-      await store.saveTask(task);
-      await store.logEvent('dynamic_item_detected', { task_id: taskId, item_id: itemId, description: item.description });
+      const itemId = await store.locks.withLocks([`task:${taskId}`], async () => {
+        const task = await store.loadTask(taskId);
+        const id = makeId('ITEM');
+        const item = {
+          schema_version: 1,
+          revision: 1,
+          item_id: id,
+          parent_task_id: taskId,
+          parent_subtask_id: args['parent-subtask-id'] ?? null,
+          source_message_id: args['source-message-id'] ?? null,
+          source_employee_number: args['source-employee-number'] ?? null,
+          description: requireArg(args, 'description'),
+          relation: args.relation ?? 'unknown',
+          workload: args.workload ?? 'unknown',
+          status: 'detected',
+          decision: null,
+          linked_subtask_id: null,
+          approval_id: null,
+          created_at: nowIso(),
+          updated_at: nowIso()
+        };
+        await store.saveItem(item);
+        task.open_item_ids = task.open_item_ids ?? [];
+        if (!task.open_item_ids.includes(id)) task.open_item_ids.push(id);
+        await store.saveTask(task);
+        await store.logEvent('dynamic_item_detected', { task_id: taskId, item_id: id, description: item.description });
+        return id;
+      });
+      const item = await store.loadItem(itemId);
       jsonOutput({ ok: true, item });
       return;
     }
@@ -327,7 +472,7 @@ async function main() {
       item.decision = decision;
 
       if (decision === 'auto_subtask') {
-        const subtask = await createSubtask(task, {
+        const subtask = await taskService.addSubtask(task.task_id, {
           title: args.title || item.description,
           topic: args.topic ?? null,
           target_employee_number: requireArg(args, 'target-employee-number'),
@@ -361,36 +506,17 @@ async function main() {
     case 'create-approval': {
       await ensureInitialized();
       const taskId = requireArg(args, 'task-id');
-      const task = await store.loadTask(taskId);
-      const approvalId = makeId('AP');
       const proposedAction = args['proposed-action-file']
         ? await readJsonFile(path.resolve(rootDir, args['proposed-action-file']))
         : null;
-      const approval = {
-        approval_id: approvalId,
-        task_id: taskId,
-        subtask_id: args['subtask-id'] ?? null,
-        item_id: args['item-id'] ?? null,
-        status: 'pending',
+      const approval = await approvalService.createApproval({
+        taskId,
+        subtaskId: args['subtask-id'] ?? null,
+        itemId: args['item-id'] ?? null,
         question: requireArg(args, 'question'),
         options: splitList(args.options),
-        proposed_action: proposedAction,
-        response: null,
-        created_at: nowIso(),
-        updated_at: nowIso(),
-        resolved_at: null
-      };
-      await store.saveApproval(approval);
-      if (!task.pending_approval_ids.includes(approvalId)) task.pending_approval_ids.push(approvalId);
-      if (approval.item_id) {
-        const item = await store.loadItem(approval.item_id);
-        item.status = 'waiting_owner';
-        item.approval_id = approvalId;
-        await store.saveItem(item);
-      }
-      task.status = 'waiting_owner';
-      await store.saveTask(task);
-      await store.logEvent('approval_created', { task_id: taskId, approval_id: approvalId, item_id: approval.item_id });
+        proposedAction
+      });
       jsonOutput({ ok: true, approval });
       return;
     }
@@ -402,6 +528,7 @@ async function main() {
       const approval = await store.loadApproval(approvalId);
       approval.status = resolution;
       approval.response = args.response ?? null;
+      approval.decision_payload = { decision: resolution, response: args.response ?? null };
       approval.resolved_at = nowIso();
       await store.saveApproval(approval);
 
@@ -423,41 +550,79 @@ async function main() {
         }
         await store.saveItem(item);
       }
-      await store.logEvent('approval_resolved', { task_id: approval.task_id, approval_id: approvalId, resolution });
-      jsonOutput({ ok: true, approval });
+
+      // Approved/modified decisions still owe the Agent an apply step.
+      let commandId = null;
+      if (['approved', 'modified'].includes(resolution)) {
+        const { command } = await commands.create({
+          type: 'approval.apply',
+          aggregateType: 'approval',
+          aggregateId: approvalId,
+          payload: { approval_id: approvalId, source: 'skill' }
+        });
+        commandId = command.command_id;
+      }
+      await store.logEvent('approval_resolved', { task_id: approval.task_id, approval_id: approvalId, resolution, command_id: commandId });
+      jsonOutput({ ok: true, approval, command_id: commandId });
       return;
     }
 
     case 'record-message': {
       await ensureInitialized();
-      const entry = await store.logMessage({
-        direction: requireArg(args, 'direction'),
-        participant_type: requireArg(args, 'participant-type'),
-        participant_id: requireArg(args, 'participant-id'),
-        content: requireArg(args, 'content'),
-        task_id: args['task-id'] ?? null,
-        subtask_id: args['subtask-id'] ?? null,
-        external_message_id: args['external-message-id'] ?? null,
-        status: 'recorded'
+      const direction = requireArg(args, 'direction');
+      const participantType = requireArg(args, 'participant-type');
+      const participantId = requireArg(args, 'participant-id');
+      const content = requireArg(args, 'content');
+      if (direction === 'inbound') {
+        const { message, attribution } = await messageService.recordInbound({
+          participantType,
+          participantId,
+          content,
+          externalMessageId: args['external-message-id'] ?? null,
+          replyToActionId: args['reply-to-action-id'] ?? null,
+          externalThreadId: args['external-thread-id'] ?? null
+        });
+        jsonOutput({
+          ok: true,
+          message,
+          attribution: {
+            status: attribution.status,
+            conversation_id: attribution.conversation?.conversation_id ?? null,
+            task_id: attribution.conversation?.task_id ?? null,
+            subtask_id: attribution.conversation?.subtask_id ?? null
+          }
+        });
+        return;
+      }
+      const message = await messageService.recordManualOutbound({
+        participantType,
+        participantId,
+        content,
+        taskId: args['task-id'] ?? null,
+        subtaskId: args['subtask-id'] ?? null,
+        externalMessageId: args['external-message-id'] ?? null
       });
-      jsonOutput({ ok: true, message: entry });
+      jsonOutput({ ok: true, message });
       return;
     }
-
 
     case 'set-cursor': {
       await ensureInitialized();
       const participantType = requireArg(args, 'participant-type');
       const participantId = requireArg(args, 'participant-id');
       const messageId = requireArg(args, 'message-id');
+      await store.locks.withLocks(['state'], async () => {
+        const state = await store.loadState();
+        const key = `${participantType}:${participantId}`;
+        state.cursors[key] = {
+          last_message_id: messageId,
+          last_message_time: args['message-time'] ?? null,
+          updated_at: nowIso()
+        };
+        await store.saveState(state);
+      });
       const state = await store.loadState();
       const key = `${participantType}:${participantId}`;
-      state.cursors[key] = {
-        last_message_id: messageId,
-        last_message_time: args['message-time'] ?? null,
-        updated_at: nowIso()
-      };
-      await store.saveState(state);
       jsonOutput({ ok: true, key, cursor: state.cursors[key] });
       return;
     }
@@ -465,66 +630,55 @@ async function main() {
     case 'update-task': {
       await ensureInitialized();
       const taskId = requireArg(args, 'task-id');
-      const task = await store.loadTask(taskId);
-      if (args.status) task.status = args.status;
-      if (args['working-summary-file']) {
-        task.working_summary = await readJsonFile(path.resolve(rootDir, args['working-summary-file']));
-      }
-      await store.saveTask(task);
-      await store.logEvent('task_updated', { task_id: taskId, status: task.status });
-      jsonOutput({ ok: true, task });
+      const { record } = await store.mutateTask(taskId, undefined, async (task) => {
+        if (args.status) task.status = args.status;
+        if (args['working-summary-file']) {
+          task.working_summary = await readJsonFile(path.resolve(rootDir, args['working-summary-file']));
+        }
+      });
+      await store.logEvent('task_updated', { task_id: taskId, status: record.status });
+      jsonOutput({ ok: true, task: record });
+      return;
+    }
+
+    case 'add-instruction': {
+      await ensureInitialized();
+      const taskId = requireArg(args, 'task-id');
+      const text = requireArg(args, 'text');
+      const result = await taskService.addInstruction(taskId, text);
+      jsonOutput({ ok: true, task_id: taskId, command_id: result.commandId });
       return;
     }
 
     case 'send-user': {
       await ensureInitialized();
       const employeeNumber = requireArg(args, 'employee-number');
-      const contacts = await store.loadConfig('contacts');
-      const contact = contacts[employeeNumber];
-      if (!contact) throw new Error(`Employee number is not configured: ${employeeNumber}`);
-      if (!contact.auto_contact) throw new Error(`Auto contact is disabled for: ${employeeNumber}`);
-      const policies = await store.loadConfig('policies');
-      const message = withAgentFooter(requireArg(args, 'text'), policies, {
-        task: args['task-id'],
-        subtask: args['subtask-id'],
-        type: args.type ?? 'communication'
+      const outcome = await sendService.sendUser({
+        employeeNumber,
+        text: requireArg(args, 'text'),
+        taskId: args['task-id'] ?? null,
+        subtaskId: args['subtask-id'] ?? null,
+        type: args.type ?? null
       });
-      const result = await executeSend({
-        actionType: 'send_user_message',
-        targetType: 'user',
-        targetId: employeeNumber,
-        cliArgs: ['im', 'send-to-user', '--receiver', contact.w3account, '--text', message],
-        content: message,
-        taskId: args['task-id'],
-        subtaskId: args['subtask-id'],
-        messageType: args.type
-      });
-      jsonOutput({ ok: result.result.ok, ...result });
+      if (outcome.queued) {
+        jsonOutput({ ok: true, queued: true, position: outcome.position, holder_task_id: outcome.holderTaskId, note: '该联系人已有进行中的沟通，子任务已进入沟通队列，未发送消息。' });
+        return;
+      }
+      jsonOutput({ ok: outcome.result.ok, ...outcome });
       return;
     }
 
     case 'send-group': {
       await ensureInitialized();
       const groupId = requireArg(args, 'group-id');
-      const groups = await store.loadConfig('groups');
-      if (!groups[groupId]?.trusted) throw new Error(`Group is not configured as trusted: ${groupId}`);
-      const policies = await store.loadConfig('policies');
-      const message = withAgentFooter(requireArg(args, 'text'), policies, {
-        task: args['task-id'],
-        approval: args['approval-id'],
-        type: args.type ?? 'notification'
+      const outcome = await sendService.sendGroup({
+        groupId,
+        text: requireArg(args, 'text'),
+        taskId: args['task-id'] ?? null,
+        approvalId: args['approval-id'] ?? null,
+        type: args.type ?? null
       });
-      const result = await executeSend({
-        actionType: 'send_group_message',
-        targetType: 'group',
-        targetId: groupId,
-        cliArgs: ['im', 'send-to-group', '--group-id', groupId, '--text', message],
-        content: message,
-        taskId: args['task-id'],
-        approvalId: args['approval-id'],
-        messageType: args.type
-      });
-      jsonOutput({ ok: result.result.ok, ...result });
+      jsonOutput({ ok: outcome.result.ok, ...outcome });
       return;
     }
 
@@ -563,6 +717,41 @@ async function main() {
       const rawId = makeId('RAW');
       await store.writeJson(path.join(store.paths().raw, `${rawId}.json`), { type: 'recent_conversation', result });
       jsonOutput({ raw_id: rawId, ...result });
+      return;
+    }
+
+    case 'tick': {
+      jsonOutput(await runTick());
+      return;
+    }
+
+    case 'complete-command': {
+      await ensureInitialized();
+      const commandId = requireArg(args, 'command-id');
+      const status = args.status === 'failed' ? 'failed' : 'succeeded';
+      const completed = await commands.complete(commandId, {
+        status,
+        error: status === 'failed'
+          ? { code: args['error-code'] ?? 'AGENT_ERROR', message: args['error-message'] ?? 'Agent 报告命令执行失败。' }
+          : null
+      });
+      await store.logEvent('command_updated', { command_id: commandId, status: completed.status });
+      jsonOutput({ ok: true, command: completed });
+      return;
+    }
+
+    case 'close-conversation': {
+      await ensureInitialized();
+      const conversationId = requireArg(args, 'conversation-id');
+      const conversation = await store.loadConversation(conversationId);
+      const result = await releaseContactSlot(store, conversation, { reason: args.reason ?? 'closed' });
+      await store.logEvent('conversation_closed', {
+        conversation_id: conversationId,
+        task_id: conversation.task_id,
+        reason: args.reason ?? 'closed',
+        promoted_task_id: result.promoted?.task_id ?? null
+      });
+      jsonOutput({ ok: true, ...result });
       return;
     }
 
@@ -606,12 +795,13 @@ async function main() {
 
     case 'resume': {
       await ensureInitialized();
-      const [tasks, approvals, items, actions, state] = await Promise.all([
+      const [tasks, approvals, items, actions, state, pendingCommands] = await Promise.all([
         store.listTasks(),
         store.listApprovals(),
         store.listItems(),
         store.listActions(),
-        store.loadState()
+        store.loadState(),
+        store.listCommands()
       ]);
       jsonOutput({
         agent_state: state,
@@ -619,7 +809,8 @@ async function main() {
         pending_approvals: approvals.filter((approval) => approval.status === 'pending'),
         open_items: items.filter((item) => !['closed', 'linked'].includes(item.status)),
         uncertain_actions: actions.filter((action) => ['executing', 'unknown'].includes(action.status)),
-        instruction: 'Recover uncertain actions first, then process pending approvals and unfinished tasks.'
+        pending_commands: pendingCommands.filter((entry) => ['queued', 'claimed', 'waiting_agent'].includes(entry.status)),
+        instruction: 'Recover uncertain actions first, process pending commands (tick), then pending approvals and unfinished tasks.'
       });
       return;
     }
@@ -627,27 +818,16 @@ async function main() {
     case 'complete-task': {
       await ensureInitialized();
       const taskId = requireArg(args, 'task-id');
-      const task = await store.loadTask(taskId);
-      const blocking = {
-        mandatory_subtasks: task.subtasks.filter((s) => s.required && s.status !== 'completed').map((s) => s.subtask_id),
-        open_items: task.open_item_ids,
-        pending_approvals: task.pending_approval_ids,
-        conflicts: task.conflicts.filter((c) => c.status !== 'resolved')
-      };
-      if (Object.values(blocking).some((entries) => entries.length > 0) && !boolArg(args.force, false)) {
-        jsonOutput({ ok: false, reason: 'Task still has blocking work.', blocking });
+      const result = await taskService.completeTask(taskId, {
+        summary: args.summary,
+        force: boolArg(args.force, false)
+      });
+      if (!result.ok) {
+        jsonOutput(result);
         process.exitCode = 2;
         return;
       }
-      task.status = 'completed';
-      task.final_summary = args.summary ?? task.final_summary;
-      task.completed_at = nowIso();
-      await store.saveTask(task);
-      const state = await store.loadState();
-      state.active_task_ids = state.active_task_ids.filter((id) => id !== taskId);
-      await store.saveState(state);
-      await store.logEvent('task_completed', { task_id: taskId });
-      jsonOutput({ ok: true, task });
+      jsonOutput({ ok: true, task: result.task });
       return;
     }
 

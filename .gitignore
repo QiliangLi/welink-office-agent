@@ -9,6 +9,9 @@ runtime/tasks/*.json
 runtime/items/*.json
 runtime/approvals/*.json
 runtime/actions/*.json
+runtime/commands/*.json
+runtime/conversations/*.json
+runtime/.locks/*
 runtime/logs/*.jsonl
 runtime/raw/*
 !runtime/**/.gitkeep

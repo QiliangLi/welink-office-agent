@@ -1,13 +1,21 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { LockManager } from './locks.mjs';
 import { ensureDir, nowIso, pathExists, readJsonFile, readOptionalJson } from './utils.mjs';
 import { makeId } from './ids.mjs';
 
+/**
+ * Single owner of every runtime read/write. All read-after-write changes to
+ * Task, Approval, Item, Action, Command, Conversation and AgentState must go
+ * through the mutate* helpers so file locks and revisions are enforced in one
+ * place. Snapshot writes keep temp file + rename for atomic replacement.
+ */
 export class Store {
   constructor(rootDir) {
     this.rootDir = rootDir;
     this.configDir = path.join(rootDir, 'config');
     this.runtimeDir = path.join(rootDir, 'runtime');
+    this.locks = new LockManager(path.join(this.runtimeDir, '.locks'));
   }
 
   paths() {
@@ -17,8 +25,11 @@ export class Store {
       items: path.join(this.runtimeDir, 'items'),
       approvals: path.join(this.runtimeDir, 'approvals'),
       actions: path.join(this.runtimeDir, 'actions'),
+      commands: path.join(this.runtimeDir, 'commands'),
+      conversations: path.join(this.runtimeDir, 'conversations'),
       logs: path.join(this.runtimeDir, 'logs'),
-      raw: path.join(this.runtimeDir, 'raw')
+      raw: path.join(this.runtimeDir, 'raw'),
+      locks: path.join(this.runtimeDir, '.locks')
     };
   }
 
@@ -41,12 +52,14 @@ export class Store {
     if (!(await pathExists(statePath))) {
       await this.writeJson(statePath, {
         schema_version: 1,
+        revision: 1,
         status: 'idle',
         initialized_at: nowIso(),
         last_started_tick: null,
         last_successful_tick: null,
         active_task_ids: [],
-        cursors: {}
+        cursors: {},
+        log_sequence: 0
       });
     }
     return { copied };
@@ -57,12 +70,30 @@ export class Store {
   }
 
   async loadState() {
-    return readJsonFile(this.paths().state);
+    const state = await readJsonFile(this.paths().state);
+    if (typeof state.log_sequence !== 'number') state.log_sequence = 0;
+    return state;
   }
 
   async saveState(state) {
     state.updated_at = nowIso();
+    state.revision = (state.revision ?? 0) + 1;
     await this.writeJson(this.paths().state, state);
+  }
+
+  /**
+   * Monotonic sequence shared by events.jsonl and messages.jsonl so merged
+   * activity feeds keep a stable order for equal timestamps.
+   */
+  async nextSequence() {
+    let value = 0;
+    await this.locks.withLocks(['state'], async () => {
+      const state = await this.loadState();
+      state.log_sequence = (state.log_sequence ?? 0) + 1;
+      value = state.log_sequence;
+      await this.saveState(state);
+    });
+    return value;
   }
 
   async writeJson(filePath, data) {
@@ -78,11 +109,57 @@ export class Store {
     await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, 'utf8');
   }
 
+  /**
+   * Read complete newline-terminated JSONL records starting at byte offset.
+   * A trailing partial line (mid-write) is not returned; its offset is
+   * reported back as the resume point so the next read retries it.
+   */
+  async readJsonl(fileName, { startOffset = 0 } = {}) {
+    const filePath = path.join(this.paths().logs, fileName);
+    let stat;
+    try {
+      stat = await fs.stat(filePath);
+    } catch (error) {
+      if (error?.code === 'ENOENT') return { entries: [], offset: startOffset, size: 0 };
+      throw error;
+    }
+    if (stat.size <= startOffset) return { entries: [], offset: startOffset, size: stat.size };
+
+    const handle = await fs.open(filePath, 'r');
+    try {
+      const length = stat.size - startOffset;
+      const buffer = Buffer.alloc(length);
+      await handle.read(buffer, 0, length, startOffset);
+      const text = buffer.toString('utf8');
+      const complete = text.endsWith('\n') ? text : text.slice(0, text.lastIndexOf('\n') + 1);
+      const entries = complete
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => {
+          try {
+            return JSON.parse(line);
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean);
+      return { entries, offset: startOffset + Buffer.byteLength(complete, 'utf8'), size: stat.size };
+    } finally {
+      await handle.close();
+    }
+  }
+
+  async readJsonlAll(fileName) {
+    const { entries } = await this.readJsonl(fileName);
+    return entries;
+  }
+
   async logEvent(type, data = {}) {
     const event = {
       event_id: makeId('EVT'),
       type,
       timestamp: nowIso(),
+      sequence: await this.nextSequence(),
       ...data
     };
     await this.appendJsonl('events.jsonl', event);
@@ -93,6 +170,7 @@ export class Store {
     const entry = {
       log_id: makeId('LOG'),
       timestamp: nowIso(),
+      sequence: await this.nextSequence(),
       ...message
     };
     await this.appendJsonl('messages.jsonl', entry);
@@ -115,12 +193,21 @@ export class Store {
     return path.join(this.paths().actions, `${actionId}.json`);
   }
 
+  commandPath(commandId) {
+    return path.join(this.paths().commands, `${commandId}.json`);
+  }
+
+  conversationPath(conversationId) {
+    return path.join(this.paths().conversations, `${conversationId}.json`);
+  }
+
   async loadTask(taskId) {
     return readJsonFile(this.taskPath(taskId));
   }
 
   async saveTask(task) {
     task.updated_at = nowIso();
+    task.revision = (task.revision ?? 0) + 1;
     await this.writeJson(this.taskPath(task.task_id), task);
   }
 
@@ -130,6 +217,7 @@ export class Store {
 
   async saveItem(item) {
     item.updated_at = nowIso();
+    item.revision = (item.revision ?? 0) + 1;
     await this.writeJson(this.itemPath(item.item_id), item);
   }
 
@@ -139,12 +227,38 @@ export class Store {
 
   async saveApproval(approval) {
     approval.updated_at = nowIso();
+    approval.revision = (approval.revision ?? 0) + 1;
     await this.writeJson(this.approvalPath(approval.approval_id), approval);
   }
 
   async saveAction(action) {
     action.updated_at = nowIso();
+    action.revision = (action.revision ?? 0) + 1;
     await this.writeJson(this.actionPath(action.action_id), action);
+  }
+
+  async loadAction(actionId) {
+    return readJsonFile(this.actionPath(actionId));
+  }
+
+  async loadCommand(commandId) {
+    return readJsonFile(this.commandPath(commandId));
+  }
+
+  async saveCommand(command) {
+    command.updated_at = nowIso();
+    command.revision = (command.revision ?? 0) + 1;
+    await this.writeJson(this.commandPath(command.command_id), command);
+  }
+
+  async loadConversation(conversationId) {
+    return readJsonFile(this.conversationPath(conversationId));
+  }
+
+  async saveConversation(conversation) {
+    conversation.updated_at = nowIso();
+    conversation.revision = (conversation.revision ?? 0) + 1;
+    await this.writeJson(this.conversationPath(conversation.conversation_id), conversation);
   }
 
   async listJson(dirPath) {
@@ -171,6 +285,106 @@ export class Store {
 
   async listActions() {
     return this.listJson(this.paths().actions);
+  }
+
+  async listCommands() {
+    return this.listJson(this.paths().commands);
+  }
+
+  async listConversations() {
+    return this.listJson(this.paths().conversations);
+  }
+
+  /**
+   * Locked mutation for one aggregate. Reloads the latest snapshot inside the
+   * lock, verifies expectedRevision (when provided), runs the mutator, saves
+   * and returns the mutated record. The mutator may return an extra result.
+   */
+  async mutateTask(taskId, expectedRevision, mutator) {
+    return this.locks.withLocks([`task:${taskId}`], async () => {
+      const task = await this.loadTask(taskId);
+      this.checkRevision(task, expectedRevision, 'task');
+      const extra = await mutator(task);
+      await this.saveTask(task);
+      return { record: task, extra };
+    });
+  }
+
+  async mutateApproval(approvalId, expectedRevision, mutator) {
+    return this.locks.withLocks([`approval:${approvalId}`], async () => {
+      const approval = await this.loadApproval(approvalId);
+      this.checkRevision(approval, expectedRevision, 'approval');
+      const extra = await mutator(approval);
+      await this.saveApproval(approval);
+      return { record: approval, extra };
+    });
+  }
+
+  async mutateItem(itemId, expectedRevision, mutator) {
+    return this.locks.withLocks([`item:${itemId}`], async () => {
+      const item = await this.loadItem(itemId);
+      this.checkRevision(item, expectedRevision, 'item');
+      const extra = await mutator(item);
+      await this.saveItem(item);
+      return { record: item, extra };
+    });
+  }
+
+  async mutateCommand(commandId, expectedRevision, mutator) {
+    return this.locks.withLocks([`command:${commandId}`], async () => {
+      const command = await this.loadCommand(commandId);
+      this.checkRevision(command, expectedRevision, 'command');
+      const extra = await mutator(command);
+      await this.saveCommand(command);
+      return { record: command, extra };
+    });
+  }
+
+  /**
+   * Multi-aggregate mutation with the canonical lock order
+   * task -> approval -> item -> command. `targets` lists
+   * { kind, id, expectedRevision? } entries; mutators[kind] receive the
+   * freshly loaded record and all snapshots are saved (same order) inside
+   * one lock window so related records stay consistent.
+   */
+  async mutateGroup(targets, mutators = {}) {
+    const order = { task: 0, approval: 1, item: 2, command: 3 };
+    const sorted = [...targets].sort((left, right) => order[left.kind] - order[right.kind]);
+    const keys = sorted.map(({ kind, id }) => `${kind}:${id}`);
+    return this.locks.withLocks(keys, async () => {
+      const loaded = {};
+      const loaders = {
+        task: (id) => this.loadTask(id),
+        approval: (id) => this.loadApproval(id),
+        item: (id) => this.loadItem(id),
+        command: (id) => this.loadCommand(id)
+      };
+      for (const target of sorted) {
+        loaded[target.kind] = await loaders[target.kind](target.id);
+        this.checkRevision(loaded[target.kind], target.expectedRevision, target.kind);
+      }
+      for (const target of sorted) {
+        if (mutators[target.kind]) await mutators[target.kind](loaded[target.kind]);
+      }
+      for (const target of sorted) {
+        if (target.kind === 'task') await this.saveTask(loaded.task);
+        else if (target.kind === 'approval') await this.saveApproval(loaded.approval);
+        else if (target.kind === 'item') await this.saveItem(loaded.item);
+        else await this.saveCommand(loaded.command);
+      }
+      return loaded;
+    });
+  }
+
+  checkRevision(record, expectedRevision, kind) {
+    if (expectedRevision === undefined || expectedRevision === null) return;
+    const current = record.revision ?? 0;
+    if (current !== expectedRevision) {
+      const error = new Error(`${kind} revision conflict: expected ${expectedRevision}, current ${current}`);
+      error.code = 'REVISION_CONFLICT';
+      error.details = { expectedRevision, currentRevision: current };
+      throw error;
+    }
   }
 
   async readRaw(fileName) {
