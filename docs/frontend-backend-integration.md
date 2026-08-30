@@ -4,7 +4,7 @@
 
 本文给出 `web-console/` 与现有 WeLink Agent runtime 的完整对接方案。目标是让页面展示真实任务、审批、计划和活动记录，并让创建任务、暂停、继续、取消、审批、补充信息、催办和追加指令能够可靠地进入 Agent 执行流程。
 
-这份设计以仓库在 2026 年 8 月 30 日的实现为依据。当前 runtime 仍由 Claude Code Skill、Node CLI 包装器、`welink-cli` 和本地 JSON/JSONL 文件组成。当前 Web 控制台只使用内存 mock，没有 HTTP 请求，也没有持久化写入。
+这份设计以仓库在 2026 年 8 月 30 日的实现为依据。当前 runtime 仍由可移植 Agent Skill、Node CLI 包装器、`welink-cli` 和本地 JSON/JSONL 文件组成。当前 Web 控制台只使用内存 mock，没有 HTTP 请求，也没有持久化写入。
 
 本文同时划清第一阶段边界。第一阶段保留本地单用户、单 Agent、文件存储和 WeLink CLI，不引入数据库，不把控制台直接连到 `welink-cli`，也不把 `runtime/raw/` 暴露给浏览器。
 
@@ -12,7 +12,7 @@
 
 ### 2.1 Runtime 已有能力
 
-Runtime 入口位于 `.claude/skills/welink-office-agent/scripts/agent.mjs`，已经具备以下能力。
+Runtime CLI 入口位于 `scripts/agent.mjs`，可复用的存储、ID、WeLink wrapper 和通用工具位于 `scripts/lib/`，已经具备以下能力。
 
 | 能力 | 当前入口 | 持久化位置 |
 | --- | --- | --- |
@@ -53,11 +53,11 @@ Runtime 入口位于 `.claude/skills/welink-office-agent/scripts/agent.mjs`，�
 
 1. 浏览器不能安全地访问本地文件系统，也不应知道 runtime 目录结构。
 2. runtime 没有 HTTP 服务。
-3. `create-task` 只创建主任务快照。任务拆解、联系人路由和消息发送依赖 Claude Agent 后续执行。
+3. `create-task` 只创建主任务快照。任务拆解、联系人路由和消息发送依赖宿主 Agent 后续执行。
 4. 前端状态和 runtime 状态名称不同。
 5. 前端审批卡片是消息、日程和澄清三种联合类型，runtime 只有通用的 `question`、`options` 和 `proposed_action`。
 6. 前端新任务包含优先级、截止时间、外部操作策略和执行方式，runtime 尚未保存这些字段。
-7. Store 使用临时文件加 rename 保证单次 JSON 写入完整，但没有跨进程锁。控制台和 Claude Skill 同时改同一任务时可能发生覆盖。
+7. Store 使用临时文件加 rename 保证单次 JSON 写入完整，但没有跨进程锁。控制台和宿主 Agent 同时改同一任务时可能发生覆盖。
 8. JSONL 事件没有读取接口，也没有可恢复的流式游标。
 9. 页面中附件、分页、产物、成本和部分详情文案仍是展示占位，runtime 没有对应数据。
 10. `completion_policy` 声明了“没有不确定 action”等条件，当前 `complete-task` 的实际检查没有覆盖全部声明项。API 不能把声明字段当成已经执行的规则。
@@ -65,7 +65,7 @@ Runtime 入口位于 `.claude/skills/welink-office-agent/scripts/agent.mjs`，�
 
 ## 3. 推荐架构
 
-推荐在浏览器与 runtime 之间增加一个只监听本机的 Console API，并增加持久化命令队列。Claude Skill 的 `tick` 消费需要推理或 WeLink 操作的命令。
+推荐在浏览器与 runtime 之间增加一个只监听本机的 Console API，并增加持久化命令队列。宿主 Agent 的 `tick` 消费需要推理或 WeLink 操作的命令。
 
 ```text
 ┌──────────────────────┐
@@ -87,7 +87,7 @@ Runtime 入口位于 `.claude/skills/welink-office-agent/scripts/agent.mjs`，�
 └──────┬───────────┘       └─────────┬──────────┘
        │                             │
        │                    ┌────────▼───────────┐
-       │                    │ Claude Skill tick │
+       │                    │ Host Agent tick   │
        │                    │ 推理、路由、推进任务 │
        │                    └────────┬───────────┘
        │                             │
@@ -990,7 +990,7 @@ server/
     ├── origin-check.mjs
     └── error-handler.mjs
 
-.claude/skills/welink-office-agent/scripts/lib/
+scripts/lib/
 ├── store.mjs
 ├── locks.mjs
 ├── commands.mjs
@@ -1153,7 +1153,7 @@ mock 数据保留给 Storybook、视觉回归或测试，不再作为生产 Prov
 3. 收到同事回复后，tick 更新 subtask，页面自动显示新活动。
 4. 触发 scope extension 审批，页面选择处理方式，Agent 正确继续。
 5. 模拟 CLI timeout，页面显示待核实，恢复后没有重复发送。
-6. 同时从页面和 Claude Skill 修改任务，revision 和锁阻止覆盖。
+6. 同时从页面和宿主 Agent 修改任务，revision 和锁阻止覆盖。
 7. 创建两个间隔联系同一人的任务，验证后一项先显示待执行，前一会话结束后自动进入当前。
 8. 分别验证带 reply/thread 标识、唯一活动会话和多候选三种回复归属路径，多候选不得串到错误任务。
 

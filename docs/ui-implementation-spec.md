@@ -2,7 +2,7 @@
 
 ## 1. 文档目标
 
-本文把 `ui_implement_outline.md` 和 `design-reference/` 中的五张概念图转换成可直接执行的工程规格。
+本文把 `ui-implementation-outline.md` 和 `docs/design-reference/` 中的五张概念图转换成可直接执行的工程规格。
 
 第一阶段目标只有一个：完成一个可运行、可交互、可响应式展示的 React UI 原型。所有数据使用 mock，暂不连接 `runtime/`、WeLink CLI、SSE 或后端 API。
 
@@ -285,7 +285,7 @@ Task Detail 的计划树必须由该结构递归渲染，不得在 JSX 中硬编
 
 ### 8.1 Overview
 
-参考 `design-reference/overview.png`。
+参考 `docs/design-reference/overview.png`。
 
 桌面结构：
 
@@ -308,7 +308,7 @@ Task Detail 的计划树必须由该结构递归渲染，不得在 JSX 中硬编
 
 ### 8.2 Tasks
 
-参考 `design-reference/tasks.png`。
+参考 `docs/design-reference/tasks.png`。
 
 桌面结构：
 
@@ -335,7 +335,7 @@ Task Detail 的计划树必须由该结构递归渲染，不得在 JSX 中硬编
 
 ### 8.3 New Task
 
-参考 `design-reference/new-task.png`。
+参考 `docs/design-reference/new-task.png`。
 
 这是单页创建流程，不拆成多步 wizard。
 
@@ -360,7 +360,7 @@ Task Detail 的计划树必须由该结构递归渲染，不得在 JSX 中硬编
 
 ### 8.4 Task Detail
 
-参考 `design-reference/task-detail.png`。
+参考 `docs/design-reference/task-detail.png`。
 
 页头：返回任务列表、标题、状态、任务 ID、创建时间、创建者，以及继续、暂停、取消、给 Agent 新指令等动作。
 
@@ -386,7 +386,7 @@ Task Detail 的计划树必须由该结构递归渲染，不得在 JSX 中硬编
 
 ### 8.5 Approvals
 
-参考 `design-reference/approvals.png`。
+参考 `docs/design-reference/approvals.png`。
 
 页头显示待处理数量、说明、全部标为已处理动作。
 

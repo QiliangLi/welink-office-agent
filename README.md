@@ -1,12 +1,13 @@
-# WeLink Office Agent Skill — MVP
+# WeLink Office Agent — MVP
 
-这是一个面向少量可信同事和群组的 Claude Code Skill。它使用工号作为用户唯一标识、群组号作为群唯一标识，通过 `welink-cli` 完成主动询问、追问、动态子任务、控制群确认、进度汇总、完整日志和断点恢复。
+这是一个面向少量可信同事和群组的可移植办公 Skill。当前仓库目录本身就是完整 Skill 包：根目录 `SKILL.md` 提供跨 Agent 入口，`scripts/` 提供确定性 runtime/CLI，`references/` 提供按需加载的命令和状态说明，并附带桌面优先的 Web 控制台。
 
 ## 当前实现范围
 
 已实现：
 
-- Claude Code 项目级 Skill；
+- 可直接安装的根目录 `SKILL.md`；
+- 独立的 runtime/CLI；
 - JSON 配置与任务快照；
 - JSONL 消息和事件日志；
 - 主任务、子任务、动态事项、审批、外部动作状态；
@@ -16,16 +17,33 @@
 - `status`、`resume` 和主任务收口检查；
 - 默认 dry-run。
 
-当前 IM 查询结果仍由 Claude 解析，因为已提供的 WeLink CLI 文档没有说明 IM 模块存在统一 JSON 输出。原始 CLI 输出会保存到 `runtime/raw/`。
+当前 IM 查询结果仍由宿主 Agent 解析，因为已提供的 WeLink CLI 文档没有说明 IM 模块存在统一 JSON 输出。原始 CLI 输出会保存到 `runtime/raw/`。
 
 ## 环境
 
 - Node.js 18 或更高版本；
 - 已安装并登录 `welink-cli`；
-- Claude Code；
-- 从本项目根目录启动 Claude Code。
+- 支持目录式 Skills、能够读取 `SKILL.md` 并执行本地命令的 Agent；
+- Skill 运行时能够访问本目录中的配置和 runtime 数据。
 
-本项目没有第三方 npm 依赖，不需要执行 `npm install`。
+根目录 runtime/CLI 没有第三方 npm 依赖，不需要执行 `npm install`。开发 Web 控制台时需在 `web-console/` 中安装其前端依赖。
+
+核心 CLI 位于 `scripts/agent.mjs`。完整目录职责和文档同步规则见 `AGENTS.md`。
+
+## 安装为 Skill
+
+把整个 `welink-office-agent/` 目录复制或链接到目标 Agent 的 Skills 目录，目标结构应保持如下形态：
+
+```text
+<agent-skills>/welink-office-agent/
+├── SKILL.md
+├── scripts/
+├── references/
+├── config/
+└── runtime/
+```
+
+不同 Agent 的 Skills 目录和调用语法不同，请以目标 Agent 的安装说明为准。不要只复制 `SKILL.md`，也不要在本仓库内部再创建 `.claude/skills/` 或 `.codex/skills/` 套壳。
 
 ## 初始化
 
@@ -64,20 +82,14 @@ config/policies.json
 npm run preflight
 ```
 
-## 在 Claude Code 中使用
+## 使用
 
-从项目根目录启动：
-
-```bash
-claude
-```
-
-Claude Code 会发现 `.claude/skills/welink-office-agent/SKILL.md`。可通过 `/skills` 或 `/welink-office-agent` 查看/调用。项目 Skill 的目录名就是默认斜杠命令名。
+下文用 `$welink-office-agent` 表示“调用目标 Agent 中的 welink-office-agent Skill”。如果目标 Agent 使用斜杠命令或其他语法，请替换为对应形式。
 
 ### 创建任务示例
 
 ```text
-/welink-office-agent 帮我确认性能测试和跨域网络方案的最新进展。性能测试找配置中的负责人，收集当前状态、阻塞问题和预计完成时间；跨域网络收集当前方案、验证结果和下一步计划。沟通过程中出现简单的必要询问可以自行完成，较大的新增工作先在控制群问我。收齐后统一汇总。
+$welink-office-agent 帮我确认性能测试和跨域网络方案的最新进展。性能测试找配置中的负责人，收集当前状态、阻塞问题和预计完成时间；跨域网络收集当前方案、验证结果和下一步计划。沟通过程中出现简单的必要询问可以自行完成，较大的新增工作先在控制群问我。收齐后统一汇总。
 ```
 
 Skill 会：
@@ -91,42 +103,30 @@ Skill 会：
 ### 执行一次轮询
 
 ```text
-/welink-office-agent tick
+$welink-office-agent tick
 ```
 
-### 使用 Claude Code loop
-
-```text
-/loop 2m /welink-office-agent tick
-```
-
-每次只处理一个有边界的 Tick：恢复状态、查询新消息、更新任务、创建动态事项、发送到期追问和输出变化。
+每次只处理一个有边界的 Tick：恢复状态、查询新消息、更新任务、创建动态事项、发送到期追问和输出变化。如果目标 Agent 支持定时或循环任务，可以按它的原生方式定期调用 `tick`。
 
 ### 查看状态
 
 ```text
-/welink-office-agent status
+$welink-office-agent status
 ```
 
 或：
 
 ```text
-/welink-office-agent status TASK-20260715-ABC123
+$welink-office-agent status TASK-20260715-ABC123
 ```
 
 ### 重新启动后恢复
 
-重新进入项目并启动 Claude Code：
-
 ```text
-/welink-office-agent resume
+$welink-office-agent resume
 ```
 
-之后继续：
-
-```text
-/loop 2m /welink-office-agent tick
-```
+恢复完成后继续按目标 Agent 的原生循环或定时机制调用 `tick`。
 
 ## 从 dry-run 切换到真实发送
 

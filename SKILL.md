@@ -1,17 +1,11 @@
 ---
 name: welink-office-agent
-description: Run a trusted-contact WeLink communication task: create and resume long-running tasks, route topics to configured employee numbers, contact colleagues through welink-cli, track dynamic subtasks, request owner decisions in the control group, and summarize progress. Use only for the local welink-office-agent project.
-when_to_use: Invoke directly for a new communication task, or with tick/resume/status arguments. Suitable for /loop-driven polling after the project configuration is complete.
-argument-hint: "<任务描述> | tick | resume | status [TASK-ID]"
-allowed-tools:
-  - Read
-  - Write
-  - Edit
-  - Glob
-  - Grep
-  - Bash(node .claude/skills/welink-office-agent/scripts/agent.mjs *)
-disallowed-tools:
-  - AskUserQuestion
+description: >-
+  Run trusted-contact WeLink communication tasks by creating and resuming
+  long-running work, routing topics to configured employees, contacting
+  colleagues through welink-cli, tracking dynamic subtasks, requesting owner
+  decisions, and summarizing progress. Use for WeLink coordination tasks in an
+  installed welink-office-agent Skill folder.
 ---
 
 # WeLink Office Agent
@@ -19,7 +13,7 @@ disallowed-tools:
 Operate only through:
 
 ```bash
-node .claude/skills/welink-office-agent/scripts/agent.mjs <command> ...
+node scripts/agent.mjs <command> ...
 ```
 
 Do not invoke `welink-cli` directly. The wrapper appends the Agent marker, writes action/message logs, and preserves recovery state.
@@ -73,9 +67,9 @@ Perform exactly one bounded processing cycle:
 10. Update task working summaries and complete a task only when the wrapper's `complete-task` check passes.
 11. Report only what changed during this tick.
 
-### Any other text: create a new task
+### Any other request: create a new task
 
-Treat `$ARGUMENTS` as the owner's task request.
+Treat the invocation arguments or current user request as the owner's task request.
 
 1. Run `create-task` with the full request.
 2. Decompose the goal into the smallest useful information-gathering subtasks.

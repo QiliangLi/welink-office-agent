@@ -1,13 +1,14 @@
 {
-  "name": "welink-office-agent-skill",
+  "name": "welink-office-agent",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "init": "node .claude/skills/welink-office-agent/scripts/agent.mjs init",
-    "preflight": "node .claude/skills/welink-office-agent/scripts/agent.mjs preflight",
-    "status": "node .claude/skills/welink-office-agent/scripts/agent.mjs status",
-    "resume": "node .claude/skills/welink-office-agent/scripts/agent.mjs resume",
+    "agent": "node scripts/agent.mjs",
+    "init": "node scripts/agent.mjs init",
+    "preflight": "node scripts/agent.mjs preflight",
+    "status": "node scripts/agent.mjs status",
+    "resume": "node scripts/agent.mjs resume",
     "test": "node --test test/*.test.mjs"
   },
   "engines": {

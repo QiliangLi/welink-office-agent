@@ -9,7 +9,7 @@ const sourceRoot = path.resolve(new URL('..', import.meta.url).pathname);
 
 async function run(root, commandArgs) {
   return new Promise((resolve, reject) => {
-    const script = path.join(root, '.claude/skills/welink-office-agent/scripts/agent.mjs');
+    const script = path.join(root, 'scripts/agent.mjs');
     const child = spawn(process.execPath, [script, ...commandArgs], { cwd: root, shell: false });
     let stdout = '';
     let stderr = '';
@@ -31,7 +31,7 @@ async function run(root, commandArgs) {
 
 async function fixture() {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'welink-agent-test-'));
-  await fs.cp(path.join(sourceRoot, '.claude'), path.join(dir, '.claude'), { recursive: true });
+  await fs.cp(path.join(sourceRoot, 'scripts'), path.join(dir, 'scripts'), { recursive: true });
   await fs.cp(path.join(sourceRoot, 'config'), path.join(dir, 'config'), { recursive: true });
   await fs.mkdir(path.join(dir, 'runtime'), { recursive: true });
   return dir;

@@ -76,7 +76,7 @@ export async function pathExists(filePath) {
 
 export function projectRootFromScript(importMetaUrl) {
   const currentFile = fileURLToPath(importMetaUrl);
-  return path.resolve(path.dirname(currentFile), '../../../..');
+  return path.resolve(path.dirname(currentFile), '..');
 }
 
 export function jsonOutput(data) {

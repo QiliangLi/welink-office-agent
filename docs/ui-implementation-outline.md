@@ -115,7 +115,7 @@ Skill
 把刚刚生成的图片放到项目里，例如：
 
 ```text
-design-reference/
+docs/design-reference/
 ├── overview.png
 ├── tasks.png
 ├── new-task.png
@@ -128,7 +128,7 @@ design-reference/
 比如做 Overview：
 
 ```text
-请根据 design-reference/overview.png 实现这个页面。
+请根据 docs/design-reference/overview.png 实现这个页面。
 
 技术栈：
 - React
@@ -558,7 +558,7 @@ welink-office-agent
 然后给它这种指令：
 
 ```text
-现在对照 design-reference/tasks.png 检查当前实现。
+现在对照 docs/design-reference/tasks.png 检查当前实现。
 
 重点检查：
 1. sidebar 宽度
