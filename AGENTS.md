@@ -33,6 +33,7 @@ Cross-layer work must read every applicable guide plus [前后端对接设计](d
 │   ├── agent-guides/        # scoped implementation constraints
 │   ├── design-reference/    # read-only visual specifications
 │   ├── reviews/             # dated, branch-specific review results
+│   ├── e2e-acceptance.md    # end-to-end acceptance handbook and record
 │   ├── frontend-backend-integration.md
 │   ├── ui-implementation-outline.md
 │   └── ui-implementation-spec.md

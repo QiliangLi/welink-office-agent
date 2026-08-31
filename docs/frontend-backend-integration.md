@@ -1,6 +1,6 @@
 # WeLink Office Agent 前后端对接设计
 
-> **实现状态（2026-08-30，第三轮复审修复后）**：阶段一至四已实现并有测试覆盖（`test/`、`server/`、`scripts/lib/`、`web-console/src/api/`）。第一、二轮评审的 findings 已在第三轮修复中全部关闭，第三轮复审（`docs/reviews/2026-08-30-main-ece9507-third-review.md`）的 T-01~T-06 也已修复：幂等记录在 HTTP 响应发送前完成持久化（未过期 running 记录让重放等待，仅过期租约判 unknown_outcome）；claim/租约恢复/取消在集合锁之后逐条取得记录锁并重读验证，不再覆盖并发 ack/begin；命令携带 `parent_task_id`，任务取消会一并撤销 `approval.apply` 等派生命令；外部发送的 executing 预落盘在任务锁内复核终态，完成与外发在任务锁上串行，完成态任务不会新增 uncertain action；终态任务创建审批被整体拒绝且不留 pending 孤儿。阶段五（附件与产物）与第 16 节列出的内容保持“明确不做”，相关能力开关为 false。OpenAPI/contracts 自动生成仍为 proposed：契约目前以 `server/schemas/` 为源，手工镜像在 `web-console/src/api/contracts.ts`。开启 live 模式前仍需按文档 §15.5 用真实 `welink-cli` 完成端到端验收。
+> **实现状态（2026-08-31，第四至七轮评审修复后）**：阶段一至四已实现并有测试覆盖（`test/`、`server/`、`scripts/lib/`、`web-console/src/api/`）。第一轮评审（`docs/reviews/frontend-backend-integration-phase-1-4-review-2026-08-30.md`）的 7 项 findings 及后续各轮残余问题已全部关闭：并发写入收口到 mutation 锁、统一持久化幂等层（reserved/running 两阶段，unknown_outcome 保护）、assignment 的 delivered/acked/executing 单调状态机（含 `parent_task_id` 取消传播）、显式 reply 标识未命中不回退、`task.retry`/failed 任务可消费、联系人槽全生命周期（入队前终态复核、晋升过滤、未收口外发保持占槽、unknown 待宿主核实）、loopback 强制与 SSE per-record cursor。评审 `docs/reviews/2026-08-31-main-c75a9d0-eighth-review.md` verdict 为 approve。**当前待办：按 `docs/e2e-acceptance.md` 完成真实 `welink-cli` 端到端验收，通过后方可保持 live。** 阶段五（附件与产物）与第 16 节列出的内容保持“明确不做”，相关能力开关为 false。OpenAPI/contracts 自动生成仍为 proposed：契约目前以 `server/schemas/` 为源，手工镜像在 `web-console/src/api/contracts.ts`。
 
 ## 1. 文档用途
 

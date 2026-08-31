@@ -10,6 +10,7 @@
 - `references/command-reference.md`、`references/runtime-schema.md`：当前可执行 Skill 契约。
 - `docs/ui-implementation-outline.md`：产品意图。
 - `docs/ui-implementation-spec.md`：可执行 UI 规格。
+- `docs/e2e-acceptance.md`：端到端验收手册与记录表；验收通过后回写状态横幅。
 - `docs/frontend-backend-integration.md`：前后端目标设计和迁移计划，必须标清 proposed 与 implemented。
 - `docs/design-reference/`：只读 UI 视觉规格。
 - `docs/agent-guides/`：按改动范围加载的实现细则。
