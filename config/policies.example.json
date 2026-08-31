@@ -1,5 +1,6 @@
 {
   "dry_run": true,
+  "send_timeout_ms": 60000,
   "agent_footer_text": "—— 此条消息来自 WeLink CLI Agent",
   "agent_marker": "[WELINK_AGENT_MESSAGE]",
   "max_active_waiting_tasks_per_contact": 1,
