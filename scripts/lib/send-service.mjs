@@ -100,7 +100,12 @@ export class SendService {
     });
 
     const policies = await this.store.loadConfig('policies');
-    const result = await runWelink(cliArgs, { dryRun: policies.dry_run === true });
+    // Optional per-deployment send timeout (wrapper already supports it);
+    // defaults to the historical 60s.
+    const sendTimeoutMs = Number.isFinite(policies.send_timeout_ms) && policies.send_timeout_ms > 0
+      ? policies.send_timeout_ms
+      : 60_000;
+    const result = await runWelink(cliArgs, { dryRun: policies.dry_run === true, timeoutMs: sendTimeoutMs });
     const finalAction = await this.store.mutateAction(actionId, (current) => {
       current.external_result = result;
       current.status = result.ok ? (result.dry_run ? 'dry_run' : 'succeeded') : (result.timed_out ? 'unknown' : 'failed');
@@ -128,13 +133,17 @@ export class SendService {
       status: finalAction.status
     });
 
-    // Post-send bookkeeping (review W-01): the subtask moves to
+    // Post-send bookkeeping (review W-01/X-01): the subtask moves to
     // waiting_reply only for a task that is still live. A task that reached
     // a terminal state while the CLI was running must not be revived — and
     // once the action has settled, this send's conversation is closed and
     // the contact slot moves to the next queued candidate here, the safe
     // settlement point (cancel/complete deliberately skip such
-    // conversations while the action is executing/unknown).
+    // conversations while the action is executing/unknown). An UNKNOWN
+    // outcome is deliberately NOT released here: whether the message
+    // reached the contact is unverified, so the conversation keeps
+    // occupying the slot until the host verifies it via the recovery flow
+    // and closes it explicitly.
     if (taskId) {
       let finishedDuringSend = false;
       if (subtaskId && result.ok) {
@@ -158,7 +167,7 @@ export class SendService {
         const task = await this.store.loadTask(taskId).catch(() => null);
         finishedDuringSend = Boolean(task && TERMINAL_CHAT_STATUSES.includes(task.status));
       }
-      if (finishedDuringSend && conversationId) {
+      if (finishedDuringSend && conversationId && finalAction.status !== 'unknown') {
         const conversation = await loadConversation(this.store, conversationId);
         if (conversation && conversation.status === 'active') {
           await releaseContactSlot(this.store, conversation, { reason: 'task_finished_during_send' });

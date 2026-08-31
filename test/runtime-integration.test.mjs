@@ -1117,3 +1117,74 @@ test('cancel with no unsettled actions releases the conversation immediately (W-
   const result = await sends.sendUser({ employeeNumber: '00123456', text: '新问题', taskId: next.task_id, subtaskId: nextSub.subtask_id });
   assert.equal(result.queued, false);
 });
+
+test('unknown outcome keeps the slot until the host closes the conversation (X-01)', async (t) => {
+  const root = await createFixture();
+  t.after(async () => fs.rm(root, { recursive: true, force: true }));
+
+  // CLI stand-in that hangs longer than the (shortened) send timeout, so
+  // the production runWelink wrapper produces a real timeout -> unknown.
+  const binDir = path.join(root, 'fixture-bin');
+  await fs.mkdir(binDir, { recursive: true });
+  await fs.writeFile(path.join(binDir, 'welink-cli'), '#!/bin/sh\nsleep 5\necho "sent"\nexit 0\n', { mode: 0o755 });
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${previousPath}`;
+  t.after(() => { process.env.PATH = previousPath; });
+
+  const store = new Store(root);
+  await store.initialize();
+  const commands = new CommandService(store);
+  const tasks = new TaskService(store, commands);
+  const sends = new SendService(store);
+  const { acquireContactSlot, releaseContactSlot } = await import('../scripts/lib/contact-slots.mjs');
+
+  const policiesPath = path.join(root, 'config/policies.json');
+  const policies = JSON.parse(await fs.readFile(policiesPath, 'utf8'));
+  policies.dry_run = false;
+  policies.send_timeout_ms = 300;
+  await fs.writeFile(policiesPath, JSON.stringify(policies, null, 2));
+
+  const taskA = await tasks.createTask({ request: '超时取消任务 A' });
+  const subA = await tasks.addSubtask(taskA.task_id, { title: '询问王璐', target_employee_number: '00123456' });
+  const sendPromise = sends.sendUser({ employeeNumber: '00123456', text: 'A 的问题', taskId: taskA.task_id, subtaskId: subA.subtask_id });
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  const actionA = (await store.listActions()).find((action) => action.task_id === taskA.task_id);
+  assert.equal(actionA.status, 'executing');
+
+  const taskB = await tasks.createTask({ request: '排队任务 B' });
+  const subB = await tasks.addSubtask(taskB.task_id, { title: '联系王璐', target_employee_number: '00123456' });
+  const queued = await acquireContactSlot(store, { contactType: 'user', contactId: '00123456', taskId: taskB.task_id, subtaskId: subB.subtask_id });
+  assert.equal(queued.acquired, false);
+
+  // Cancel A while the CLI is still hanging.
+  await tasks.cancel(taskA.task_id);
+
+  // The wrapper times out: the action lands as unknown.
+  await sendPromise;
+  const settledA = await store.loadAction(actionA.action_id);
+  assert.equal(settledA.status, 'unknown', 'delayed CLI produces an unknown action');
+  assert.equal((await store.loadTask(taskA.task_id)).status, 'cancelled');
+
+  // The conversation must still belong to A: an unverified send never
+  // hands the slot to the next task.
+  let actives = (await store.listConversations()).filter((entry) => entry.status === 'active');
+  assert.equal(actives.length, 1);
+  assert.equal(actives[0].task_id, taskA.task_id, 'A keeps the slot while the outcome is unknown');
+
+  const earlyB = await sends.sendUser({ employeeNumber: '00123456', text: 'B 的问题', taskId: taskB.task_id, subtaskId: subB.subtask_id });
+  assert.equal(earlyB.queued, true, 'B keeps waiting until the host verifies and closes');
+
+  // Host recovery flow verifies the result and closes the conversation
+  // explicitly; only then is B promoted.
+  const conversationA = await store.loadConversation(settledA.conversation_id);
+  const release = await releaseContactSlot(store, conversationA, { reason: 'verified' });
+  assert.equal(release.released, true);
+  assert.equal(release.promoted.task_id, taskB.task_id);
+
+  actives = (await store.listConversations()).filter((entry) => entry.status === 'active');
+  assert.equal(actives.length, 1);
+  assert.equal(actives[0].task_id, taskB.task_id);
+  const lateB = await sends.sendUser({ employeeNumber: '00123456', text: 'B 的问题', taskId: taskB.task_id, subtaskId: subB.subtask_id });
+  assert.equal(lateB.queued, false);
+  await new Promise((resolve) => setTimeout(resolve, 6000)); // let the hanging stand-in exit
+});
