@@ -2,13 +2,16 @@ import { CheckCircle2, FileText, ListChecks, MessageCircle, ShieldCheck } from "
 import { formatDateTime } from "../../lib/task-utils";
 import type { ActivityEvent, DisplayStatus } from "../../types/domain";
 
-const EVENT_ICONS = {
+/** Shared per-kind icon mapping; reused by the global activity page. */
+export const ACTIVITY_KIND_ICONS = {
   message: MessageCircle,
   file: FileText,
   status: CheckCircle2,
   approval: ShieldCheck,
   task: ListChecks,
 } satisfies Record<ActivityEvent["kind"], typeof MessageCircle>;
+
+const EVENT_ICONS = ACTIVITY_KIND_ICONS;
 
 interface ActivityTimelineProps {
   events: ActivityEvent[];

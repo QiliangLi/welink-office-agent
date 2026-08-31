@@ -1,5 +1,6 @@
 import type {
   ActivityEvent,
+  ActivityListResponse,
   ApprovalDecisionInput,
   ApprovalDecisionResult,
   ApprovalListResponse,
@@ -32,6 +33,16 @@ export interface TaskListParams {
   limit?: number;
 }
 
+export interface ActivityListParams {
+  kind?: string[];
+  q?: string;
+  taskId?: string;
+  occurredFrom?: string;
+  occurredTo?: string;
+  cursor?: string | null;
+  limit?: number;
+}
+
 export interface ApprovalListParams {
   status?: string[];
   taskId?: string;
@@ -57,6 +68,7 @@ export interface ConsoleClient {
   getTasks(params?: TaskListParams): Promise<TaskListResponse>;
   getTaskDetail(taskId: string): Promise<TaskDetailResponse>;
   getTaskEvents(taskId: string, cursor?: string | null): Promise<TaskEventsResponse>;
+  getActivity(params?: ActivityListParams): Promise<ActivityListResponse>;
   createTask(input: CreateTaskInput): Promise<CreateTaskResult>;
   taskCommand(taskId: string, input: TaskCommandInput): Promise<TaskCommandResult>;
   requestReminder(taskId: string, subtaskId: string): Promise<{ command: { id: string; status: string } }>;
@@ -164,6 +176,19 @@ export class HttpConsoleClient implements ConsoleClient {
   getTaskEvents(taskId: string, cursor: string | null = null): Promise<TaskEventsResponse> {
     const suffix = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
     return this.request("GET", `/tasks/${encodeURIComponent(taskId)}/events${suffix}`);
+  }
+
+  getActivity(params: ActivityListParams = {}): Promise<ActivityListResponse> {
+    const search = new URLSearchParams();
+    for (const kind of params.kind ?? []) search.append("kind", kind);
+    if (params.q) search.set("q", params.q);
+    if (params.taskId) search.set("taskId", params.taskId);
+    if (params.occurredFrom) search.set("occurredFrom", params.occurredFrom);
+    if (params.occurredTo) search.set("occurredTo", params.occurredTo);
+    if (params.cursor) search.set("cursor", params.cursor);
+    if (params.limit) search.set("limit", String(params.limit));
+    const suffix = search.toString() ? `?${search}` : "";
+    return this.request("GET", `/activity${suffix}`);
   }
 
   createTask(input: CreateTaskInput): Promise<CreateTaskResult> {

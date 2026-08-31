@@ -1,5 +1,6 @@
 import type {
   ActivityEvent,
+  ActivityListResponse,
   ApprovalDecisionInput,
   ApprovalDecisionResult,
   ApprovalDto,
@@ -19,10 +20,24 @@ import type {
   TaskEventsResponse,
   TaskListResponse,
 } from "../api/contracts";
-import type { ApprovalListParams, ConsoleClient, OverviewParams, TaskListParams } from "../api/client";
+import type { ActivityListParams, ApprovalListParams, ConsoleClient, OverviewParams, TaskListParams } from "../api/client";
 import { initialActivity, initialApprovals, initialPlans, initialTasks, event } from "./data";
 
 const nowIso = () => new Date().toISOString();
+
+function encodeMockCursor(offset: number) {
+  return btoa(JSON.stringify({ o: offset }));
+}
+
+function decodeMockCursor(cursor?: string | null) {
+  if (!cursor) return 0;
+  try {
+    const parsed = JSON.parse(atob(cursor)) as { o?: unknown };
+    return Number.isInteger(parsed?.o) && (parsed.o as number) >= 0 ? (parsed.o as number) : 0;
+  } catch {
+    return 0;
+  }
+}
 
 const mockOwner: ContactDto = { id: "00000000", name: "齐亮", department: "产品部", initials: "QL" };
 
@@ -175,6 +190,25 @@ export class MockConsoleClient implements ConsoleClient {
 
   getTaskEvents(taskId: string): Promise<TaskEventsResponse> {
     return Promise.resolve({ items: this.activity[taskId] ?? [], nextCursor: null });
+  }
+
+  getActivity(params: ActivityListParams = {}): Promise<ActivityListResponse> {
+    const kinds = params.kind ?? [];
+    const query = (params.q ?? "").trim().toLocaleLowerCase("zh-CN");
+    const cutoff = params.occurredFrom ? Date.parse(params.occurredFrom) : null;
+    const newestFirst = Object.values(this.activity)
+      .flat()
+      .sort((left, right) => right.occurredAt.localeCompare(left.occurredAt) || right.sequence - left.sequence);
+    const filtered = newestFirst
+      .filter((item) => kinds.length === 0 || kinds.includes(item.kind))
+      .filter((item) => !params.taskId || item.taskId === params.taskId)
+      .filter((item) => cutoff === null || Date.parse(item.occurredAt) >= cutoff)
+      .filter((item) => !query || [item.title, item.detail ?? "", item.taskId ?? ""].join(" ").toLocaleLowerCase("zh-CN").includes(query));
+    const offset = decodeMockCursor(params.cursor);
+    const limit = params.limit ?? 30;
+    const page = filtered.slice(offset, offset + limit);
+    const nextCursor = offset + page.length < filtered.length ? encodeMockCursor(offset + page.length) : null;
+    return Promise.resolve({ items: page, nextCursor, total: filtered.length, snapshotAt: nowIso() });
   }
 
   async createTask(input: CreateTaskInput): Promise<CreateTaskResult> {

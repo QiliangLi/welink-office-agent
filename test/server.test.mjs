@@ -565,3 +565,146 @@ test('HTTP create + immediate replay is stable across repeated rounds (T-01 regr
     assert.equal(replay.body.command.id, first.body.command.id, `round ${round}: same command`);
   }
 });
+
+test('global activity merges event and message sources, newest first', async (t) => {
+  const { json, root } = await bootstrap(t, async ({ store, tasks }) => {
+    const first = await tasks.createTask({ request: '第一个动态检查任务，收集项目进展。' });
+    const second = await tasks.createTask({ request: '第二个动态检查任务，整理复盘结论。' });
+    await store.logMessage({
+      direction: 'outbound',
+      participant_type: 'user',
+      participant_id: '00200000',
+      content: '请回复性能测试进展',
+      status: 'succeeded',
+      task_id: first.task_id,
+      subtask_id: null,
+      conversation_id: null
+    });
+    await store.logEvent('message_attributed', { task_id: second.task_id });
+  });
+
+  const feed = await json('/activity');
+  assert.equal(feed.status, 200);
+  const items = feed.body.items;
+  assert.ok(items.length >= 4, 'event and message sources are both represented');
+  assert.ok(items.some((item) => item.kind === 'message'), 'feed includes the message log source');
+  assert.ok(items.some((item) => item.kind === 'task'), 'feed includes the event log source');
+  for (let i = 1; i < items.length; i += 1) {
+    const previous = items[i - 1];
+    const current = items[i];
+    assert.ok(
+      previous.occurredAt > current.occurredAt ||
+        (previous.occurredAt === current.occurredAt && previous.sequence >= current.sequence),
+      `newest first with sequence tiebreak at index ${i}`
+    );
+  }
+  assert.ok(feed.body.snapshotAt, 'response carries a snapshot timestamp');
+  const serialized = JSON.stringify(feed.body);
+  assert.ok(!serialized.includes('w3account'), 'no w3account in response');
+  assert.ok(!serialized.includes(root), 'no runtime paths in response');
+});
+
+test('activity supports kind, task and time filters with cursor pagination', async (t) => {
+  const { json } = await bootstrap(t, async ({ store, tasks }) => {
+    const first = await tasks.createTask({ request: '筛选检查任务甲，收集市场反馈。' });
+    await tasks.createTask({ request: '筛选检查任务乙，整理技术结论。' });
+    await store.logMessage({
+      direction: 'inbound',
+      participant_type: 'user',
+      participant_id: '00200000',
+      content: '这是来自同事的回复内容',
+      status: 'succeeded',
+      task_id: first.task_id,
+      subtask_id: null,
+      conversation_id: null
+    });
+  });
+
+  const messages = await json('/activity?kind=message');
+  assert.equal(messages.status, 200);
+  assert.ok(messages.body.items.length >= 1);
+  assert.ok(messages.body.items.every((item) => item.kind === 'message'), 'kind filter holds');
+
+  const taskList = await json('/tasks');
+  const taskId = taskList.body.items[0].id;
+  const byTask = await json(`/activity?taskId=${encodeURIComponent(taskId)}`);
+  assert.ok(byTask.body.items.length >= 1);
+  assert.ok(byTask.body.items.every((item) => item.taskId === taskId), 'task filter holds');
+
+  const future = new Date(Date.now() + 60_000).toISOString();
+  const empty = await json(`/activity?occurredFrom=${encodeURIComponent(future)}`);
+  assert.equal(empty.body.total, 0);
+  assert.deepEqual(empty.body.items, []);
+
+  const page1 = await json('/activity?limit=2');
+  assert.equal(page1.body.items.length, 2);
+  assert.ok(page1.body.nextCursor, 'more pages available');
+  const page2 = await json(`/activity?limit=2&cursor=${encodeURIComponent(page1.body.nextCursor)}`);
+  const page1Ids = new Set(page1.body.items.map((item) => item.id));
+  const page2Ids = page2.body.items.map((item) => item.id);
+  assert.ok(page2Ids.every((id) => !page1Ids.has(id)), 'cursor pages do not overlap');
+  assert.ok(page1Ids.size + page2Ids.length <= page1.body.total, 'pages stay within total');
+  if (page2Ids.length > 0) {
+    const boundaryOlder = page1.body.items[page1.body.items.length - 1];
+    assert.ok(boundaryOlder.occurredAt >= page2.body.items[0].occurredAt, 'pages run newest to oldest');
+  }
+});
+
+test('activity keeps same-timestamp records ordered by sequence', async (t) => {
+  const { json } = await bootstrap(t, async ({ store, tasks }) => {
+    const task = await tasks.createTask({ request: '时间戳并列检查任务，描述内容足够长。' });
+    const at = new Date().toISOString();
+    const base = {
+      direction: 'outbound',
+      participant_type: 'user',
+      participant_id: '00200000',
+      status: 'succeeded',
+      task_id: task.task_id,
+      subtask_id: null,
+      conversation_id: null
+    };
+    await store.appendJsonl('messages.jsonl', { ...base, log_id: 'MSG-TIE-OLDER', timestamp: at, sequence: 9001, content: '时间并列较早' });
+    await store.appendJsonl('messages.jsonl', { ...base, log_id: 'MSG-TIE-NEWER', timestamp: at, sequence: 9002, content: '时间并列较晚' });
+  });
+
+  const feed = await json('/activity');
+  assert.equal(feed.status, 200);
+  const ids = feed.body.items.map((item) => item.id);
+  assert.ok(ids.indexOf('MSG-TIE-NEWER') < ids.indexOf('MSG-TIE-OLDER'), 'higher sequence first at identical timestamps');
+});
+
+test('activity rejects invalid kind, time and limit with 422', async (t) => {
+  const { json } = await bootstrap(t);
+  assert.equal((await json('/activity?kind=bogus')).status, 422);
+  assert.equal((await json('/activity?kind=message&kind=bogus')).status, 422);
+  assert.equal((await json('/activity?occurredFrom=not-a-date')).status, 422);
+  assert.equal((await json('/activity?occurredTo=yesterday')).status, 422);
+  assert.equal((await json('/activity?limit=0')).status, 422);
+  assert.equal((await json('/activity?limit=101')).status, 422);
+  assert.equal((await json('/activity?limit=abc')).status, 422);
+
+  const valid = await json('/activity?kind=message&occurredFrom=2026-01-01T00:00:00.000Z&limit=100');
+  assert.equal(valid.status, 200);
+  assert.equal(valid.body.error, undefined);
+});
+
+test('SSE stream keeps the API alive instead of crashing the reply fail-safe', async (t) => {
+  const { json, server } = await bootstrap(t);
+  const controller = new AbortController();
+  const stream = await fetch(`${server.baseUrl}/events/stream`, { signal: controller.signal });
+  assert.equal(stream.status, 200);
+  assert.equal(stream.headers.get('content-type'), 'text/event-stream; charset=utf-8');
+  const reader = stream.body.getReader();
+  const { value } = await reader.read();
+  assert.match(new TextDecoder().decode(value), /event: hello/);
+
+  // Regression: the router's no-reply fail-safe used to sendJson over the
+  // already-streaming response (ERR_HTTP_HEADERS_SENT) and kill the process.
+  const healthWhileStreaming = await json('/health');
+  assert.equal(healthWhileStreaming.status, 200);
+
+  controller.abort();
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const healthAfterClose = await json('/health');
+  assert.equal(healthAfterClose.status, 200);
+});

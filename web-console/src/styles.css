@@ -297,7 +297,6 @@ svg { width: 18px; height: 18px; stroke-width: 1.9; }
 .nav-item span { min-width: 0; display: flex; flex-direction: column; }
 .nav-item strong { font-size: 14px; line-height: 1.25; white-space: nowrap; }
 .nav-item small { font-size: 11px; margin-top: 3px; color: var(--text-muted); white-space: nowrap; }
-.nav-item-disabled { opacity: 0.7; cursor: not-allowed; }
 
 .sidebar-helper { margin-top: auto; display: flex; flex-direction: column; align-items: center; padding-top: 18px; }
 .helper-note { position: relative; margin: 0 6px -8px; padding: 12px 13px; background: var(--surface-subtle); border: 1px solid var(--border); border-radius: 14px; color: var(--text-secondary); font-size: 12px; box-shadow: var(--shadow-card); transform: rotate(-3deg); }
@@ -752,3 +751,79 @@ svg { width: 18px; height: 18px; stroke-width: 1.9; }
 
 .timeline-more { margin-top: 10px; }
 .approval-error { margin: 0 0 4px; }
+
+/* sidebar pages: activity, artifacts, settings (docs/sidebar-pages-design.md §8) */
+.filter-label { color: var(--text-muted); font-size: 12px; font-weight: 650; white-space: nowrap; }
+.activity-toolbar { display: grid; grid-template-columns: 140px minmax(240px, 1fr) 140px auto; gap: 12px; margin-bottom: 16px; align-items: center; }
+
+.activity-feed-panel { min-width: 0; padding: 6px 18px 16px; }
+.activity-day-group + .activity-day-group { margin-top: 8px; }
+.activity-day-heading { padding: 12px 4px 8px; font-size: 12px; color: var(--text-muted); border-bottom: 1px solid var(--border); }
+.activity-feed { margin: 0; padding: 0; list-style: none; }
+.activity-entry { border-radius: 12px; padding-right: 6px; }
+a.activity-entry { color: inherit; }
+a.activity-entry:hover { background: var(--surface-subtle); }
+a.activity-entry:hover .timeline-copy strong { color: var(--text-primary); }
+.activity-task-ref { display: inline-block; margin-top: 5px; padding: 2px 6px; border-radius: 6px; background: var(--surface-strong); color: var(--text-muted); font-size: 10px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+
+.activity-row-skeleton { min-height: 56px; margin: 10px 0; border-radius: 12px; background: linear-gradient(100deg, var(--surface-subtle) 40%, var(--surface-strong) 50%, var(--surface-subtle) 60%); background-size: 200% 100%; animation: skeleton-shine 1.4s ease-in-out infinite; }
+.activity-more { width: 100%; margin-top: 8px; }
+.activity-more-error { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 10px; padding: 10px; border-radius: var(--radius-control); background: var(--danger-soft); color: var(--danger); font-size: 12px; }
+.activity-more-error .button { min-height: 32px; padding: 0 10px; font-size: 12px; }
+
+.page-banner { margin-bottom: 14px; padding: 10px 14px; border: 1px solid var(--border); border-radius: var(--radius-control); }
+.page-banner span { flex: 1; min-width: 0; }
+.page-banner .button { min-height: 32px; padding: 0 10px; font-size: 12px; }
+.activity-error-banner { border-color: color-mix(in srgb, var(--danger) 24%, var(--border)); }
+.activity-new-banner { border-color: color-mix(in srgb, var(--warning) 24%, var(--border)); }
+
+.capability-unavailable { min-height: 340px; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 28px; }
+.capability-unavailable > svg { width: 32px; height: 32px; color: var(--warning); }
+.capability-unavailable h2 { margin-top: 12px; font-size: 17px; }
+.capability-unavailable p { max-width: 460px; margin: 5px 0 16px; color: var(--text-muted); }
+.capability-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
+
+.settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
+.settings-grid .panel { min-width: 0; padding: 18px; }
+.settings-capability-panel { grid-column: 1 / -1; }
+.settings-user { display: flex; align-items: flex-start; gap: 14px; }
+.settings-user .avatar { width: 52px; height: 52px; flex: none; font-size: 16px; }
+.settings-dl { display: grid; flex: 1; min-width: 0; margin: 0; }
+.settings-dl > div { min-height: 48px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--border); }
+.settings-dl > div:last-child { border-bottom: 0; }
+.settings-dl dt { color: var(--text-muted); font-size: 12px; white-space: nowrap; }
+.settings-dl dd { margin: 0; font-weight: 650; text-align: right; overflow-wrap: anywhere; }
+.settings-card-error { display: flex; align-items: center; gap: 10px; color: var(--danger); font-size: 12px; }
+.settings-card-error .button { min-height: 32px; padding: 0 10px; font-size: 12px; }
+.mode-note { margin-top: 12px; padding: 10px 12px; border-radius: var(--radius-control); background: var(--warning-soft); color: var(--warning); font-size: 12px; line-height: 1.6; }
+.mode-note-live { background: var(--info-soft); color: var(--info); }
+.capability-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.capability-item { min-height: 64px; display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 13px; background: var(--surface-subtle); }
+.capability-item > div { display: flex; flex-direction: column; min-width: 0; }
+.capability-item strong { font-size: 13px; }
+.capability-item small { margin-top: 3px; color: var(--text-muted); font-size: 11px; }
+.capability-on { color: var(--success); }
+.capability-off { color: var(--text-faint); }
+
+@media (prefers-reduced-motion: reduce) {
+  .activity-row-skeleton { animation: none; }
+}
+
+@media (max-width: 1023px) {
+  .settings-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 859px) {
+  .activity-toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .capability-list { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* Below 768px the activity filters stack vertically (design §9). */
+@media (max-width: 767px) {
+  .activity-toolbar { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 639px) {
+  .capability-actions { flex-direction: column; width: 100%; }
+  .capability-actions .button { width: 100%; }
+}

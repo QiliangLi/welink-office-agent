@@ -123,6 +123,14 @@ export interface TaskEventsResponse {
   nextCursor: string | null;
 }
 
+/** Cross-task feed: pages are newest-first within the merged stable order. */
+export interface ActivityListResponse {
+  items: ActivityEvent[];
+  nextCursor: string | null;
+  total: number;
+  snapshotAt: string;
+}
+
 export type ApprovalKind = "message" | "schedule" | "clarification" | "scope_change";
 
 export type ApprovalDecisionStatus = "pending" | "approved" | "rejected" | "edited";

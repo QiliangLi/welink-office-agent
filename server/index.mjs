@@ -8,6 +8,7 @@ import { CommandService } from '../scripts/lib/commands.mjs';
 import { createRouter, sendJson } from './app.mjs';
 import { TaskReadService } from './services/task-read-service.mjs';
 import { ApprovalReadService } from './services/approval-read-service.mjs';
+import { ActivityReadService } from './services/activity-read-service.mjs';
 import { ConsoleCommandService } from './services/console-command-service.mjs';
 import { EventStreamService } from './services/event-stream-service.mjs';
 import { IdempotencyService } from './services/idempotency-service.mjs';
@@ -18,6 +19,7 @@ import * as taskRoutes from './routes/tasks.mjs';
 import * as approvalRoutes from './routes/approvals.mjs';
 import * as commandRoutes from './routes/commands.mjs';
 import * as eventRoutes from './routes/events.mjs';
+import * as activityRoutes from './routes/activity.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(here, '..');
@@ -102,6 +104,7 @@ async function main() {
     consoleCommandService: new ConsoleCommandService(store, commandService),
     taskReadService: new TaskReadService(store),
     approvalReadService: new ApprovalReadService(store),
+    activityReadService: new ActivityReadService(store),
     eventStreamService: new EventStreamService(store),
     idempotencyService: null,
     makeRequestId: () => `REQ-${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).slice(2, 6).toUpperCase()}`,
@@ -133,6 +136,7 @@ async function main() {
   router.registerAll(approvalRoutes);
   router.registerAll(commandRoutes);
   router.registerAll(eventRoutes);
+  router.registerAll(activityRoutes);
 
   const distDir = path.join(projectRoot, 'web-console', 'dist');
   let staticAvailable = false;

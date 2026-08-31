@@ -99,9 +99,11 @@ export function createRouter(context) {
             await context.idempotencyService.markRunning(idempotencyRecordKey, idempotencyAttemptId);
           }
           await matched.handler({ req, res, params, query, repeat, body, requestId, reply, context, idempotencyKey });
-          if (!captured) {
+          if (!captured && !matched.options.rawResponse) {
             // Handler produced no reply — fail the idempotency attempt and
             // answer with a stable error instead of leaving the socket open.
+            // rawResponse routes (SSE) own the socket and stream past this
+            // point, so there is nothing to fail or send.
             if (idempotencyRecordKey) await context.idempotencyService.fail(idempotencyRecordKey, idempotencyAttemptId);
             const noReply = toApiError(Object.assign(new Error('处理器未返回响应。'), { status: 500, code: 'INTERNAL_ERROR' }));
             sendJson(res, noReply.status, { error: errorBody(noReply), requestId }, requestId);
@@ -119,6 +121,13 @@ export function createRouter(context) {
         const apiError = toApiError(error);
         if (apiError.status >= 500) {
           console.error(`[console-api] ${requestId}`, error);
+        }
+        // A rawResponse route (SSE) may have already sent its headers; the
+        // only safe failure answer there is closing the stream, never a
+        // second writeHead (which would crash the process).
+        if (res.headersSent) {
+          res.end();
+          return;
         }
         sendJson(res, apiError.status, { error: errorBody(apiError), requestId }, requestId);
       }

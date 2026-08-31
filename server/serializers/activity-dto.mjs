@@ -136,6 +136,8 @@ function messageToActivity(entry, context) {
 /**
  * Merge both logs into one stable feed. When `task` is provided the feed is
  * filtered to that task; otherwise it is the global recent activity.
+ * `limit: null` returns the whole merged feed so callers that paginate
+ * themselves (activity-read-service) are not pre-truncated.
  */
 export function buildActivity({ events, messages, task = null, approvals = [], contactsConfig = null, groupsConfig = null, limit = 50 }) {
   const context = { task, approvals, contactsConfig, groupsConfig };
@@ -152,7 +154,7 @@ export function buildActivity({ events, messages, task = null, approvals = [], c
   filtered.sort((left, right) =>
     left.occurredAt.localeCompare(right.occurredAt) || left.sequence - right.sequence
   );
-  return filtered.slice(-limit);
+  return limit == null ? filtered : filtered.slice(-limit);
 }
 
 export { initialsOf };

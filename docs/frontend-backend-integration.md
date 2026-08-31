@@ -1,6 +1,8 @@
 # WeLink Office Agent 前后端对接设计
 
 > **实现状态（2026-08-31，第四至七轮评审修复后）**：阶段一至四已实现并有测试覆盖（`test/`、`server/`、`scripts/lib/`、`web-console/src/api/`）。第一轮评审（`docs/reviews/frontend-backend-integration-phase-1-4-review-2026-08-30.md`）的 7 项 findings 及后续各轮残余问题已全部关闭：并发写入收口到 mutation 锁、统一持久化幂等层（reserved/running 两阶段，unknown_outcome 保护）、assignment 的 delivered/acked/executing 单调状态机（含 `parent_task_id` 取消传播）、显式 reply 标识未命中不回退、`task.retry`/failed 任务可消费、联系人槽全生命周期（入队前终态复核、晋升过滤、未收口外发保持占槽、unknown 待宿主核实）、loopback 强制与 SSE per-record cursor。评审 `docs/reviews/2026-08-31-main-c75a9d0-eighth-review.md` verdict 为 approve。**当前待办：按 `docs/e2e-acceptance.md` 完成真实 `welink-cli` 端到端验收，通过后方可保持 live。** 阶段五（附件与产物）与第 16 节列出的内容保持“明确不做”，相关能力开关为 false。OpenAPI/contracts 自动生成仍为 proposed：契约目前以 `server/schemas/` 为源，手工镜像在 `web-console/src/api/contracts.ts`。
+>
+> **2026-09-01 增量**：`docs/sidebar-pages-design.md` 第一阶段已实现——新增只读接口 `GET /api/v1/activity`（见 §7.5.1）与 `/activity`、`/artifacts`、`/settings` 三个控制台页面；产物能力开关仍为 false，设置页为只读运行信息。
 
 ## 1. 文档用途
 
@@ -606,6 +608,25 @@ progress = completed required subtasks / all required subtasks × 100
 `kind` 第一阶段使用 `task`、`status`、`message`、`approval`、`file`。首次请求返回最近 N 条，但同一批内必须按 `occurredAt ASC, sequence ASC` 排列；获取更早一页后，前端把该批整体前插。`sequence` 是 runtime 内单调递增的稳定次序，用来处理相同时间戳，不能用随机 event ID 排序。
 
 时间线箭头是否流动完全由前端展示：只有任务 `displayStatus=running` 且至少有两个活动节点时播放流动效果；`queued`、等待、暂停和终态都静止。API 不返回动画开关，避免把视觉表现写入业务模型。最新一项由排序结果确定，前端不依赖后端持久化 `isCurrent`。
+
+#### `GET /api/v1/activity`（已实现）
+
+跨任务全局动态只读接口，供 `/activity` 页面使用。复用 `server/serializers/activity-dto.mjs` 合并 events 与 messages 日志，路由层不重新解释 runtime 日志；筛选与 cursor 分页位于 `server/services/activity-read-service.mjs`。
+
+查询参数如下。
+
+| 参数 | 说明 |
+| --- | --- |
+| `kind` | 可重复的活动类型：`task`、`status`、`message`、`approval`、`file` |
+| `taskId` | 精确任务 ID |
+| `q` | 标题、详情、任务 ID 或任务标题关键词 |
+| `occurredFrom` / `occurredTo` | ISO 8601 时间窗口 |
+| `cursor` | 上一页返回的不透明游标（基于升序稳定排序的绝对偏移，日志只追加，旧页不失效） |
+| `limit` | 默认 30，最大 100 |
+
+响应为 `{ items: ActivityEvent[], nextCursor, total, snapshotAt }`，页内从新到旧，相同时间戳按 `sequence` 稳定排序。非法 `kind`、时间和 `limit` 返回统一的 422 `VALIDATION_ERROR`。`overview.recentActivity` 保持独立聚合，不拆成对浏览器额外的请求。
+
+
 
 ### 7.6 创建任务
 
