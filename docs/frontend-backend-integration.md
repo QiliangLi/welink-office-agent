@@ -2,7 +2,7 @@
 
 > **实现状态（2026-08-31，第四至七轮评审修复后）**：阶段一至四已实现并有测试覆盖（`test/`、`server/`、`scripts/lib/`、`web-console/src/api/`）。第一轮评审（`docs/reviews/frontend-backend-integration-phase-1-4-review-2026-08-30.md`）的 7 项 findings 及后续各轮残余问题已全部关闭：并发写入收口到 mutation 锁、统一持久化幂等层（reserved/running 两阶段，unknown_outcome 保护）、assignment 的 delivered/acked/executing 单调状态机（含 `parent_task_id` 取消传播）、显式 reply 标识未命中不回退、`task.retry`/failed 任务可消费、联系人槽全生命周期（入队前终态复核、晋升过滤、未收口外发保持占槽、unknown 待宿主核实）、loopback 强制与 SSE per-record cursor。评审 `docs/reviews/2026-08-31-main-c75a9d0-eighth-review.md` verdict 为 approve。**当前待办：按 `docs/e2e-acceptance.md` 完成真实 `welink-cli` 端到端验收，通过后方可保持 live。** 阶段五（附件与产物）与第 16 节列出的内容保持“明确不做”，相关能力开关为 false。OpenAPI/contracts 自动生成仍为 proposed：契约目前以 `server/schemas/` 为源，手工镜像在 `web-console/src/api/contracts.ts`。
 >
-> **2026-09-01 增量**：`docs/sidebar-pages-design.md` 第一阶段已实现——新增只读接口 `GET /api/v1/activity`（见 §7.5.1）与 `/activity`、`/artifacts`、`/settings` 三个控制台页面；产物能力开关仍为 false，设置页为只读运行信息。
+> **2026-09-01 增量**：`docs/sidebar-pages-design.md` 第一阶段已实现——新增只读接口 `GET /api/v1/activity`（见 §7.5.1）与 `/activity`、`/artifacts`、`/settings` 三个控制台页面；产物能力开关仍为 false。同日追加：设置页「可联系同事」配置管理（`GET /api/v1/contacts`、`POST /api/v1/contacts/commands`，见 §7.5.2）、SSE no-reply 兜底崩溃修复，以及 Windows 兼容修复（测试助手路径、`welink-cli` 在 Windows 上的 `.cmd` 解析）。
 
 ## 1. 文档用途
 
@@ -625,6 +625,22 @@ progress = completed required subtasks / all required subtasks × 100
 | `limit` | 默认 30，最大 100 |
 
 响应为 `{ items: ActivityEvent[], nextCursor, total, snapshotAt }`，页内从新到旧，相同时间戳按 `sequence` 稳定排序。非法 `kind`、时间和 `limit` 返回统一的 422 `VALIDATION_ERROR`。`overview.recentActivity` 保持独立聚合，不拆成对浏览器额外的请求。
+
+#### `GET /api/v1/contacts` 与 `POST /api/v1/contacts/commands`（已实现）
+
+设置页「可联系同事」的配置接口。读取返回展示安全字段（`employeeNumber`、`name`、`address`、`department`、`avatarInitials`、`expertise`、`autoContact`、`autoReply`）；`w3account` 永不进入响应（§11.2）。
+
+命令入口使用受限联合类型：
+
+```json
+{ "type": "upsert", "employeeNumber": "00200000", "name": "王璐", "department": "市场部", "autoContact": true }
+```
+
+```json
+{ "type": "remove", "employeeNumber": "00200000" }
+```
+
+联系人变更不涉及 Agent 推理或外部发送，属于确定性本地配置写入：在 `Store.mutateConfig` 的文件锁下读改写 `config/contacts.json`，由 API 直接执行并返回 200（与 pause/cancel 同类），同时仍经过 CSRF 校验和统一幂等层。更新时未提交的文件字段（如 `w3account`、`expertise`）原样保留。非法员工号（非 4–16 位数字）返回 422 `CONTACT_PAYLOAD_INVALID`；缺少必填字段的请求体返回 400 `VALIDATION_ERROR`。
 
 
 

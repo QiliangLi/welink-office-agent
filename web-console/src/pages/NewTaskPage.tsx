@@ -105,7 +105,7 @@ export function NewTaskPage() {
 
   return (
     <div className="page new-task-page">
-      <div className="new-task-heading"><div><Link to="/tasks" className="back-link"><ArrowLeft />返回任务</Link><h1>创建新任务 <Sparkles /></h1><p>告诉 Agent 你需要完成的工作，它会规划步骤、推进执行并在关键节点请你确认。</p></div><div className="heading-mascot"><AgentMascot mood="working" scene="create" size="lg" /><span className="floating-check"><Check /></span></div></div>
+      <div className="new-task-heading"><div><Link to="/tasks" className="back-link"><ArrowLeft />返回任务</Link><h1>创建新任务 <Sparkles /></h1><p>告诉 Agent 你需要完成的工作，它会规划步骤、推进执行并在关键节点请你确认。</p></div></div>
       <div className="new-task-layout">
         <form className="task-form" onSubmit={(event) => { event.preventDefault(); if (!descriptionError) setConfirmOpen(true); }}>
           <section className="form-card prompt-card">

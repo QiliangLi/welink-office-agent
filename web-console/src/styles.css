@@ -123,14 +123,21 @@ svg { width: 18px; height: 18px; stroke-width: 1.9; }
 .skip-link:focus { transform: translateY(72px); }
 
 .app-shell {
+  /* 100vh fallback first: older engines (e.g. legacy Chromium on Windows)
+     ignore 100dvh, which used to collapse the shell height. */
+  min-height: 100vh;
   min-height: 100dvh;
   display: grid;
   grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
-  grid-template-rows: var(--topbar-h) minmax(0, 1fr);
+  /* Row 1 is reserved for the offline/degraded banner; without an explicit
+     area the banner auto-placed into the 64px topbar row and pushed the
+     topbar into an implicit bottom row. */
+  grid-template-rows: auto var(--topbar-h) minmax(0, 1fr);
 }
 
 .topbar {
   grid-column: 1 / -1;
+  grid-row: 2;
   position: sticky;
   top: 0;
   z-index: var(--z-topbar);
@@ -258,11 +265,12 @@ svg { width: 18px; height: 18px; stroke-width: 1.9; }
 
 .sidebar {
   grid-column: 1;
-  grid-row: 2;
+  grid-row: 3;
   position: sticky;
   top: var(--topbar-h);
   z-index: var(--z-sidebar);
   align-self: start;
+  height: calc(100vh - var(--topbar-h));
   height: calc(100dvh - var(--topbar-h));
   display: flex;
   flex-direction: column;
@@ -303,8 +311,8 @@ svg { width: 18px; height: 18px; stroke-width: 1.9; }
 .helper-note::after { content: ""; position: absolute; left: 26px; bottom: -7px; width: 12px; height: 12px; background: var(--surface-subtle); border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); transform: rotate(45deg); }
 .sidebar-scrim { display: none; }
 
-.app-main { grid-column: 2; grid-row: 2; min-width: 0; }
-.page { min-height: calc(100dvh - var(--topbar-h)); padding: 24px; }
+.app-main { grid-column: 2; grid-row: 3; min-width: 0; }
+.page { min-height: calc(100vh - var(--topbar-h)); min-height: calc(100dvh - var(--topbar-h)); padding: 24px; }
 
 .page-heading,
 .new-task-heading,
@@ -535,7 +543,6 @@ svg { width: 18px; height: 18px; stroke-width: 1.9; }
 .new-task-heading { max-width: 1320px; margin: 0 auto 6px; align-items: center; min-height: 150px; padding: 0 22px; }
 .new-task-heading h1 { display: flex; align-items: center; gap: 10px; margin-top: 14px; }.new-task-heading h1 svg { color: var(--primary); width: 26px; height: 26px; }
 .back-link { min-height: 36px; display: inline-flex; align-items: center; gap: 6px; color: var(--primary); font-weight: 650; white-space: nowrap; }.back-link svg { width: 16px; }
-.heading-mascot { position: relative; min-width: 240px; display: flex; justify-content: center; }.floating-check { position: absolute; right: 30px; top: 20px; width: 38px; height: 38px; display: grid; place-items: center; border-radius: 13px; background: var(--success-soft); color: var(--success); transform: rotate(8deg); }
 .new-task-layout { max-width: 1320px; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 1fr) 296px; gap: 24px; align-items: start; }
 .task-form { min-width: 0; display: flex; flex-direction: column; gap: 14px; }
 .form-card { padding: 20px; }
@@ -636,7 +643,7 @@ svg { width: 18px; height: 18px; stroke-width: 1.9; }
   .task-toolbar { grid-template-columns: minmax(0, 1fr) minmax(130px, 0.6fr); }.select-field:nth-of-type(3) { grid-column: 1 / 2; }.view-toggle { grid-column: 2 / 3; grid-row: 2; justify-self: stretch; }.view-toggle button { flex: 1; min-width: 0; }
   .task-table { display: block; }.task-table thead { display: none; }.task-table tbody { display: grid; gap: 12px; padding: 12px; }.task-table tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding: 14px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); }.task-table td { display: block !important; height: auto; padding: 0; border: 0; overflow: visible; }.task-table td:first-child { grid-column: 1 / -1; }.task-table td:nth-child(4) { grid-column: 1 / -1; }.task-table td::before { display: block; margin-bottom: 3px; color: var(--text-muted); font-size: 10px; }.task-table td:nth-child(2)::before { content: "进度"; }.task-table td:nth-child(3)::before { content: "状态"; }.task-table td:nth-child(4)::before { content: "当前动作"; }.task-table td:nth-child(5)::before { content: "等待原因"; }.task-table td:nth-child(6)::before { content: "更新时间"; }
   .task-board { grid-template-columns: minmax(0, 1fr); }
-  .new-task-heading { min-height: 120px; padding-inline: 0; }.heading-mascot { display: none; }.advanced-grid { grid-template-columns: minmax(0, 1fr); }.inspiration-list { grid-template-columns: minmax(0, 1fr); }
+  .new-task-heading { min-height: 120px; padding-inline: 0; }.advanced-grid { grid-template-columns: minmax(0, 1fr); }.inspiration-list { grid-template-columns: minmax(0, 1fr); }
   .detail-title-row { align-items: flex-start; flex-direction: column; }.detail-actions { width: 100%; }.detail-rail { grid-template-columns: minmax(0, 1fr); }.current-state-card { grid-template-columns: minmax(0, 1fr); }.current-state-card > header { grid-column: auto; }
   .approval-body { grid-template-columns: minmax(0, 1fr); margin-left: 0; }.approval-reason { padding: 15px 0 0; border-left: 0; border-top: 1px solid var(--border); }.approval-actions { margin-left: 0; flex-wrap: wrap; }.approval-actions .button { flex: 1; }.approval-tips { grid-template-columns: minmax(0, 1fr); }.approval-tips .tips-mascot,.approval-tips > h2,.tips-link { grid-column: auto; }
 }
@@ -693,6 +700,7 @@ svg { width: 18px; height: 18px; stroke-width: 1.9; }
 .topbar .icon-button { position: relative; }
 
 .app-banner {
+  grid-column: 1 / -1;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -805,6 +813,35 @@ a.activity-entry:hover .timeline-copy strong { color: var(--text-primary); }
 .capability-on { color: var(--success); }
 .capability-off { color: var(--text-faint); }
 
+.settings-contacts-panel { grid-column: 1 / -1; }
+.contacts-hint { color: var(--text-muted); font-size: 11px; text-align: right; max-width: 320px; }
+.contact-list { margin: 0; padding: 0; list-style: none; }
+.contact-list li { min-height: 60px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid var(--border); }
+.contact-list li:last-child { border-bottom: 0; }
+.contact-info { min-width: 0; display: flex; flex-direction: column; flex: 1; }
+.contact-info strong { font-size: 13px; overflow-wrap: anywhere; }
+.contact-info small { margin-top: 3px; color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.contact-permission { display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; border-radius: 99px; font-size: 11px; font-weight: 650; white-space: nowrap; }
+.contact-permission svg { width: 12px; height: 12px; }
+.contact-permission-on { color: var(--success); background: var(--success-soft); }
+.contact-permission-off { color: var(--text-muted); background: var(--slate-soft); }
+.contact-actions { display: flex; gap: 2px; }
+.contact-remove { color: var(--danger); }
+.contact-empty { color: var(--text-muted); font-size: 12px; }
+
+.contact-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; align-items: end; margin-top: 14px; padding: 14px; border: 1px solid var(--border); border-radius: 13px; background: var(--surface-subtle); }
+.contact-form-title { grid-column: 1 / -1; font-weight: 700; font-size: 13px; }
+.contact-form label { min-width: 0; display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--text-muted); }
+.contact-form label > span { font-weight: 650; }
+.contact-form input:not([type="checkbox"]) { min-height: 40px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: var(--radius-control); background: var(--surface); color: var(--text-primary); }
+.contact-form input:not([type="checkbox"]):focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+.contact-form input:disabled { opacity: 0.6; }
+.contact-form label small { color: var(--danger); font-size: 11px; }
+.contact-checkbox { flex-direction: row !important; align-items: center; gap: 8px; min-height: 40px; color: var(--text-secondary) !important; }
+.contact-checkbox input { width: 16px; height: 16px; accent-color: var(--primary); }
+.contact-form-actions { grid-column: 1 / -1; display: flex; gap: 10px; }
+.contact-form-error { grid-column: 1 / -1; margin: 0; color: var(--danger); font-size: 12px; }
+
 @media (prefers-reduced-motion: reduce) {
   .activity-row-skeleton { animation: none; }
 }
@@ -816,14 +853,21 @@ a.activity-entry:hover .timeline-copy strong { color: var(--text-primary); }
 @media (max-width: 859px) {
   .activity-toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .capability-list { grid-template-columns: minmax(0, 1fr); }
+  .contacts-hint { display: none; }
+  .contact-form { grid-template-columns: minmax(0, 1fr); }
 }
 
 /* Below 768px the activity filters stack vertically (design §9). */
 @media (max-width: 767px) {
   .activity-toolbar { grid-template-columns: minmax(0, 1fr); }
+  .contact-list li { flex-wrap: wrap; }
+  .contact-permission { margin-left: 42px; }
 }
 
 @media (max-width: 639px) {
   .capability-actions { flex-direction: column; width: 100%; }
   .capability-actions .button { width: 100%; }
+  .contact-list li { min-height: 0; padding: 10px 0; }
+  .contact-permission { margin-left: 0; }
+  .contact-actions { margin-left: auto; }
 }

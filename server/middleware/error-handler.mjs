@@ -37,7 +37,8 @@ const STATUS_TO_CODE = {
   REMINDER_LIMIT_REACHED: 409,
   CONTACT_NOT_CONFIGURED: 422,
   AUTO_CONTACT_DISABLED: 422,
-  GROUP_NOT_TRUSTED: 422
+  GROUP_NOT_TRUSTED: 422,
+  CONTACT_PAYLOAD_INVALID: 422
 };
 
 /** Map runtime errors (already tagged with .code) onto the HTTP contract. */

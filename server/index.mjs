@@ -20,6 +20,7 @@ import * as approvalRoutes from './routes/approvals.mjs';
 import * as commandRoutes from './routes/commands.mjs';
 import * as eventRoutes from './routes/events.mjs';
 import * as activityRoutes from './routes/activity.mjs';
+import * as contactRoutes from './routes/contacts.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(here, '..');
@@ -137,6 +138,7 @@ async function main() {
   router.registerAll(commandRoutes);
   router.registerAll(eventRoutes);
   router.registerAll(activityRoutes);
+  router.registerAll(contactRoutes);
 
   const distDir = path.join(projectRoot, 'web-console', 'dist');
   let staticAvailable = false;

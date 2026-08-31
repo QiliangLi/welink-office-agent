@@ -708,3 +708,67 @@ test('SSE stream keeps the API alive instead of crashing the reply fail-safe', a
   const healthAfterClose = await json('/health');
   assert.equal(healthAfterClose.status, 200);
 });
+
+test('contacts API manages the whitelist without exposing w3account', async (t) => {
+  const { json, post, headers, root } = await bootstrap(t, async ({ store }) => {
+    await store.mutateConfig('contacts', (config) => {
+      config['00200000'] = {
+        name: '王璐',
+        address: '璐姐',
+        w3account: 'w00200000',
+        department: '市场部',
+        auto_contact: true,
+        auto_reply: false
+      };
+    });
+  });
+
+  const list = await json('/contacts');
+  assert.equal(list.status, 200);
+  assert.ok(list.body.items.some((item) => item.employeeNumber === '00200000' && item.name === '王璐'));
+  assert.ok(!JSON.stringify(list.body).includes('w3account'), 'w3account never crosses the API');
+
+  const created = await post('/contacts/commands', {
+    type: 'upsert',
+    employeeNumber: '00300000',
+    name: '李然',
+    department: '技术部',
+    autoContact: false
+  }, headers);
+  assert.equal(created.status, 200);
+  assert.equal(created.body.contact.name, '李然');
+  assert.equal(created.body.contact.autoContact, false);
+
+  const updated = await post('/contacts/commands', {
+    type: 'upsert',
+    employeeNumber: '00200000',
+    name: '王璐璐',
+    autoContact: true
+  }, { ...headers, 'idempotency-key': 'idem-contact-update' });
+  assert.equal(updated.status, 200);
+  assert.equal(updated.body.contact.name, '王璐璐');
+  const { Store: LiveStore } = await import('../scripts/lib/store.mjs');
+  const config = await new LiveStore(root).loadConfig('contacts');
+  assert.equal(config['00200000'].w3account, 'w00200000', 'unknown file fields survive console edits');
+  assert.equal(config['00200000'].department, '市场部', 'unset fields keep their stored value');
+
+  const removed = await post('/contacts/commands', { type: 'remove', employeeNumber: '00300000' }, { ...headers, 'idempotency-key': 'idem-contact-remove' });
+  assert.equal(removed.status, 200);
+  assert.equal(removed.body.removed, true);
+  const after = await json('/contacts');
+  assert.ok(after.body.items.every((item) => item.employeeNumber !== '00300000'));
+});
+
+test('contacts commands validate employee numbers and required names', async (t) => {
+  const { post, headers } = await bootstrap(t);
+  const badNumber = await post('/contacts/commands', { type: 'upsert', employeeNumber: '00abc', name: '格式错误', autoContact: true }, headers);
+  assert.equal(badNumber.status, 422);
+  assert.equal(badNumber.body.error.code, 'CONTACT_PAYLOAD_INVALID');
+
+  const missingName = await post('/contacts/commands', { type: 'upsert', employeeNumber: '00400000', autoContact: true }, { ...headers, 'idempotency-key': 'idem-contact-noname' });
+  assert.equal(missingName.status, 400);
+  assert.equal(missingName.body.error.code, 'VALIDATION_ERROR');
+
+  const tooShortNumber = await post('/contacts/commands', { type: 'remove', employeeNumber: '12' }, { ...headers, 'idempotency-key': 'idem-contact-shortnum' });
+  assert.equal(tooShortNumber.status, 400);
+});

@@ -21,7 +21,7 @@
 - `/approvals`：待我处理。
 - `/activity`：动态。跨任务活动时间线，数据来自 `GET /api/v1/activity`；筛选写入 URL，SSE 只使查询失效并提示"有新动态"，由用户决定何时刷新，浏览旧页时不回拉第一页。
 - `/artifacts`：产物。`health.capabilities.artifacts` 为 false 时只显示能力说明卡，不得展示虚构产物、空表头或下载按钮。
-- `/settings`：设置。只读运行信息（当前用户、运行状态、能力开关），员工号展示脱敏；不提供配置写入，不用 disabled input 冒充可编辑设置。
+- `/settings`：设置。运行信息（当前用户、运行状态、能力开关）保持只读，员工号展示脱敏；「可联系同事」为唯一可编辑的本地配置（`GET/POST /api/v1/contacts`），写操作是锁下的确定性配置变更。不用 disabled input 冒充可编辑设置。
 
 ## 视觉与动效
 

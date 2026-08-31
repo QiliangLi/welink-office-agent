@@ -5,6 +5,9 @@ import type {
   ApprovalDecisionResult,
   ApprovalListResponse,
   CommandDto,
+  ContactCommandInput,
+  ContactCommandResult,
+  ContactListResponse,
   CreateTaskInput,
   CreateTaskResult,
   HealthDto,
@@ -76,6 +79,8 @@ export interface ConsoleClient {
   decide(approvalId: string, input: ApprovalDecisionInput): Promise<ApprovalDecisionResult>;
   bulkDecisions(input: { approvalIds: string[]; decision: "mark_for_edit" }): Promise<{ changed: string[] }>;
   getCommand(commandId: string): Promise<CommandDto>;
+  getContacts(): Promise<ContactListResponse>;
+  contactCommand(input: ContactCommandInput): Promise<ContactCommandResult>;
 }
 
 export class HttpConsoleClient implements ConsoleClient {
@@ -223,6 +228,14 @@ export class HttpConsoleClient implements ConsoleClient {
 
   getCommand(commandId: string): Promise<CommandDto> {
     return this.request("GET", `/commands/${encodeURIComponent(commandId)}`);
+  }
+
+  getContacts(): Promise<ContactListResponse> {
+    return this.request("GET", "/contacts");
+  }
+
+  contactCommand(input: ContactCommandInput): Promise<ContactCommandResult> {
+    return this.request("POST", "/contacts/commands", { body: input });
   }
 }
 

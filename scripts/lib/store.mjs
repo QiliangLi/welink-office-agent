@@ -70,6 +70,20 @@ export class Store {
     return readJsonFile(path.join(this.configDir, `${name}.json`));
   }
 
+  /**
+   * Locked read-modify-write of config/*.json for deterministic console
+   * edits (e.g. the contacts whitelist). LockManager sanitizes the key to
+   * NTFS-safe characters, so Windows lock files stay creatable.
+   */
+  async mutateConfig(name, mutator) {
+    return this.locks.withLocks([`config-${name}`], async () => {
+      const config = await this.loadConfig(name).catch(() => ({}));
+      await mutator(config);
+      await this.writeJson(path.join(this.configDir, `${name}.json`), config);
+      return config;
+    });
+  }
+
   async loadState() {
     const state = await readJsonFile(this.paths().state);
     if (typeof state.log_sequence !== 'number') state.log_sequence = 0;

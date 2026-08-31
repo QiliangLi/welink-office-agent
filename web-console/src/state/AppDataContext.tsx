@@ -5,6 +5,8 @@ import { useEventStream } from "../api/event-stream";
 import type {
   ApprovalDecisionInput,
   ApprovalDecisionResult,
+  ContactCommandInput,
+  ContactCommandResult,
   CreateTaskInput,
   CreateTaskResult,
   HealthDto,
@@ -31,6 +33,7 @@ interface AppDataContextValue {
   requestReminder: (taskId: string, subtaskId: string) => Promise<void>;
   decide: (approvalId: string, input: ApprovalDecisionInput) => Promise<ApprovalDecisionResult>;
   bulkMarkForEdit: (approvalIds: string[]) => Promise<string[]>;
+  saveContact: (input: ContactCommandInput) => Promise<ContactCommandResult>;
   refreshAll: () => void;
 }
 
@@ -153,6 +156,17 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     [client, invalidate],
   );
 
+  const saveContact = useCallback(
+    async (input: ContactCommandInput) => {
+      const result = await client.contactCommand(input);
+      // Contact names feed task DTOs and the send whitelist, so the task
+      // read models go stale together with the contacts list.
+      invalidate(["contacts", "overview", "tasks", "task"]);
+      return result;
+    },
+    [client, invalidate],
+  );
+
   const refreshAll = useCallback(() => queryCache.invalidate("*"), []);
 
   const value = useMemo<AppDataContextValue>(
@@ -168,9 +182,10 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       requestReminder,
       decide,
       bulkMarkForEdit,
+      saveContact,
       refreshAll,
     }),
-    [client, dataSource, session, health, healthUnavailable, streamOffline, createTask, taskCommand, requestReminder, decide, bulkMarkForEdit, refreshAll],
+    [client, dataSource, session, health, healthUnavailable, streamOffline, createTask, taskCommand, requestReminder, decide, bulkMarkForEdit, saveContact, refreshAll],
   );
 
   return <AppDataContext.Provider value={value}>{children}</AppDataContext.Provider>;

@@ -4,8 +4,11 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-const sourceRoot = path.resolve(new URL('..', import.meta.url).pathname);
+// fileURLToPath keeps this working on Windows (URL.pathname would produce
+// a leading slash before the drive letter).
+const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 async function run(root, commandArgs) {
   return new Promise((resolve, reject) => {

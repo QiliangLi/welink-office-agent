@@ -304,3 +304,29 @@ export interface CommandDto {
   completedAt: string | null;
   error: { code: string; message: string; retryable?: boolean; position?: number } | null;
 }
+
+/** Display-safe contact config entry; w3account never crosses the API. */
+export interface ContactConfigDto {
+  employeeNumber: string;
+  name: string;
+  address: string | null;
+  department: string | null;
+  avatarInitials: string | null;
+  expertise: string[];
+  autoContact: boolean;
+  autoReply: boolean;
+}
+
+export interface ContactListResponse {
+  items: ContactConfigDto[];
+  snapshotAt: string;
+}
+
+export type ContactCommandInput =
+  | { type: "upsert"; employeeNumber: string; name: string; department?: string | null; address?: string | null; autoContact: boolean }
+  | { type: "remove"; employeeNumber: string };
+
+export interface ContactCommandResult {
+  contact?: ContactConfigDto;
+  removed?: boolean;
+}

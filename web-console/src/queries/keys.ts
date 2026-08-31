@@ -7,6 +7,7 @@ export const queryKeys = {
   taskEvents: (taskId: string) => ["taskEvents", taskId],
   approvals: (status: string) => ["approvals", status],
   activity: (params?: unknown) => ["activity", params ? JSON.stringify(params) : "list"],
+  contacts: () => ["contacts"],
 };
 
 /**

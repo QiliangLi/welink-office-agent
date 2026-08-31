@@ -6,7 +6,11 @@ import type {
   ApprovalDto,
   ApprovalListResponse,
   CommandDto,
+  ContactCommandInput,
+  ContactCommandResult,
+  ContactConfigDto,
   ContactDto,
+  ContactListResponse,
   CreateTaskInput,
   CreateTaskResult,
   HealthDto,
@@ -21,7 +25,7 @@ import type {
   TaskListResponse,
 } from "../api/contracts";
 import type { ActivityListParams, ApprovalListParams, ConsoleClient, OverviewParams, TaskListParams } from "../api/client";
-import { initialActivity, initialApprovals, initialPlans, initialTasks, event } from "./data";
+import { initialActivity, initialApprovals, initialPlans, initialTasks, event, people } from "./data";
 
 const nowIso = () => new Date().toISOString();
 
@@ -80,12 +84,24 @@ export class MockConsoleClient implements ConsoleClient {
   private activity: Record<string, ActivityEvent[]>;
   private approvals: ApprovalDto[];
   private commands: CommandDto[] = [];
+  private contactsConfig: ContactConfigDto[];
 
   constructor() {
     this.tasks = structuredClone(initialTasks);
     this.plans = structuredClone(initialPlans);
     this.activity = structuredClone(initialActivity);
     this.approvals = structuredClone(initialApprovals);
+    const colleague = (person: (typeof people)[keyof typeof people]): ContactConfigDto => ({
+      employeeNumber: person.id,
+      name: person.name,
+      address: null,
+      department: person.department,
+      avatarInitials: person.initials,
+      expertise: [],
+      autoContact: true,
+      autoReply: true,
+    });
+    this.contactsConfig = [colleague(people.wang), colleague(people.li), colleague(people.zhang)];
   }
 
   private touch(taskId: string, status?: TaskDto["displayStatus"]) {
@@ -324,5 +340,37 @@ export class MockConsoleClient implements ConsoleClient {
     const command = this.commands.find((entry) => entry.id === commandId);
     if (!command) return Promise.reject(new Error("命令不存在"));
     return Promise.resolve(command);
+  }
+
+  getContacts(): Promise<ContactListResponse> {
+    const items = [...this.contactsConfig].sort(
+      (left, right) => left.name.localeCompare(right.name, "zh-CN") || left.employeeNumber.localeCompare(right.employeeNumber),
+    );
+    return Promise.resolve({ items, snapshotAt: nowIso() });
+  }
+
+  async contactCommand(input: ContactCommandInput): Promise<ContactCommandResult> {
+    if (input.type === "remove") {
+      const before = this.contactsConfig.length;
+      this.contactsConfig = this.contactsConfig.filter((entry) => entry.employeeNumber !== input.employeeNumber);
+      return { removed: this.contactsConfig.length < before };
+    }
+    if (!/^\d{4,16}$/.test(input.employeeNumber)) {
+      throw Object.assign(new Error("员工号必须是 4 到 16 位数字。"), { code: "CONTACT_PAYLOAD_INVALID" });
+    }
+    const next: ContactConfigDto = {
+      employeeNumber: input.employeeNumber,
+      name: input.name.trim(),
+      address: input.address ?? null,
+      department: input.department ?? null,
+      avatarInitials: input.name.trim().slice(0, 2).toUpperCase(),
+      expertise: [],
+      autoContact: input.autoContact,
+      autoReply: false,
+    };
+    const index = this.contactsConfig.findIndex((entry) => entry.employeeNumber === input.employeeNumber);
+    if (index >= 0) this.contactsConfig[index] = { ...this.contactsConfig[index], ...next, expertise: this.contactsConfig[index].expertise };
+    else this.contactsConfig.push(next);
+    return { contact: next };
   }
 }

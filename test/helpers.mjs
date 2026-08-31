@@ -2,8 +2,11 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-const sourceRoot = path.resolve(new URL('..', import.meta.url).pathname);
+// fileURLToPath keeps this working on Windows, where URL.pathname would
+// carry a leading slash before the drive letter (/C:/...).
+const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 /** Copy the portable package (scripts/config/server) into a temp fixture. */
 export async function createFixture({ withServer = false } = {}) {
