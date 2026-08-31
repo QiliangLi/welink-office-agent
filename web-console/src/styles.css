@@ -44,6 +44,9 @@
   --radius-card: 18px;
   --radius-panel: 22px;
   --topbar-h: 64px;
+  /* Measured banner height while the offline/degraded banner is visible;
+     AppLayout keeps it in sync so all vertical offsets account for it. */
+  --banner-h: 0px;
   --sidebar-w: 232px;
   --z-topbar: 50;
   --z-sidebar: 45;
@@ -139,7 +142,7 @@ svg { width: 18px; height: 18px; stroke-width: 1.9; }
   grid-column: 1 / -1;
   grid-row: 2;
   position: sticky;
-  top: 0;
+  top: var(--banner-h);
   z-index: var(--z-topbar);
   height: var(--topbar-h);
   display: flex;
@@ -267,11 +270,11 @@ svg { width: 18px; height: 18px; stroke-width: 1.9; }
   grid-column: 1;
   grid-row: 3;
   position: sticky;
-  top: var(--topbar-h);
+  top: calc(var(--topbar-h) + var(--banner-h));
   z-index: var(--z-sidebar);
   align-self: start;
-  height: calc(100vh - var(--topbar-h));
-  height: calc(100dvh - var(--topbar-h));
+  height: calc(100vh - var(--topbar-h) - var(--banner-h));
+  height: calc(100dvh - var(--topbar-h) - var(--banner-h));
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -312,7 +315,7 @@ svg { width: 18px; height: 18px; stroke-width: 1.9; }
 .sidebar-scrim { display: none; }
 
 .app-main { grid-column: 2; grid-row: 3; min-width: 0; }
-.page { min-height: calc(100vh - var(--topbar-h)); min-height: calc(100dvh - var(--topbar-h)); padding: 24px; }
+.page { min-height: calc(100vh - var(--topbar-h) - var(--banner-h)); min-height: calc(100dvh - var(--topbar-h) - var(--banner-h)); padding: 24px; }
 
 .page-heading,
 .new-task-heading,
@@ -625,12 +628,12 @@ svg { width: 18px; height: 18px; stroke-width: 1.9; }
   .app-shell { grid-template-columns: minmax(0, 1fr); }
   .app-main { grid-column: 1; }
   .menu-button { display: inline-grid; }
-  .sidebar { position: fixed; left: 0; top: var(--topbar-h); width: 264px; transform: translateX(-104%); transition: transform 180ms ease; box-shadow: var(--shadow-panel); }
+  .sidebar { position: fixed; left: 0; top: calc(var(--topbar-h) + var(--banner-h)); width: 264px; transform: translateX(-104%); transition: transform 180ms ease; box-shadow: var(--shadow-panel); }
   .sidebar-open { transform: translateX(0); }
   .sidebar-mobile-head { min-height: 42px; display: flex; align-items: center; justify-content: space-between; padding-left: 10px; }
   .nav-item { justify-content: flex-start; padding-inline: 15px; }
   .nav-item span,.sidebar-helper { display: flex; }
-  .sidebar-scrim { display: block; position: fixed; inset: var(--topbar-h) 0 0; z-index: calc(var(--z-sidebar) - 1); border: 0; background: var(--mask); }
+  .sidebar-scrim { display: block; position: fixed; inset: calc(var(--topbar-h) + var(--banner-h)) 0 0; z-index: calc(var(--z-sidebar) - 1); border: 0; background: var(--mask); }
   .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .tasks-layout,.approvals-layout { grid-template-columns: minmax(0, 1fr); }.tasks-rail { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }.new-task-promo { grid-column: 1 / -1; }.approval-tips { position: static; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }.approval-tips .tips-mascot { grid-column: 1 / -1; }.approval-tips > h2 { grid-column: 1 / -1; }.tips-link { grid-column: 1 / -1; }
   .new-task-layout { grid-template-columns: minmax(0, 1fr); }.inspiration-panel { position: static; min-height: auto; }.inspiration-mascot { min-height: 150px; }.inspiration-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -701,6 +704,9 @@ svg { width: 18px; height: 18px; stroke-width: 1.9; }
 
 .app-banner {
   grid-column: 1 / -1;
+  position: sticky;
+  top: 0;
+  z-index: calc(var(--z-topbar) + 1);
   display: flex;
   align-items: center;
   gap: 10px;

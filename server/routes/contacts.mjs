@@ -22,8 +22,10 @@ export function register(register, context) {
       const contact = await upsertContact(context.store, {
         employeeNumber: body.employeeNumber,
         name: body.name,
-        department: body.department ?? null,
-        address: body.address ?? null,
+        // Pass through untouched so undefined (keep stored value) survives
+        // alongside null (clear the stored value).
+        department: body.department,
+        address: body.address,
         autoContact: body.autoContact ?? false
       });
       reply(200, { contact });

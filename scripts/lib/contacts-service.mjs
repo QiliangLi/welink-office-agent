@@ -51,13 +51,16 @@ export async function upsertContact(store, input) {
     error.code = 'CONTACT_PAYLOAD_INVALID';
     throw error;
   }
+  // Optional text fields: omitted keeps the stored value, null clears it,
+  // a string replaces it.
+  const optional = (value, existing) => (value === undefined ? existing ?? null : value);
   await store.mutateConfig('contacts', (config) => {
     const existing = config[input.employeeNumber] ?? {};
     config[input.employeeNumber] = {
       ...existing,
       name,
-      address: input.address ?? existing.address ?? null,
-      department: input.department ?? existing.department ?? null,
+      address: optional(input.address, existing.address),
+      department: optional(input.department, existing.department),
       auto_contact: input.autoContact === true
     };
   });

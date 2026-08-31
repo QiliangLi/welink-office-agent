@@ -31,14 +31,18 @@ export class ActivityReadService {
     });
 
     const taskTitles = new Map(context.tasks.map((task) => [task.task_id, task.title]));
+    // Time windows compare as instants: ISO strings with timezone offsets
+    // or mixed precision must not be compared lexicographically.
+    const fromMs = occurredFrom ? Date.parse(occurredFrom) : null;
+    const toMs = occurredTo ? Date.parse(occurredTo) : null;
     let filtered = feed;
     if (kinds && kinds.length) {
       const allowed = new Set(kinds);
       filtered = filtered.filter((item) => allowed.has(item.kind));
     }
     if (taskId) filtered = filtered.filter((item) => item.taskId === taskId);
-    if (occurredFrom) filtered = filtered.filter((item) => String(item.occurredAt) >= occurredFrom);
-    if (occurredTo) filtered = filtered.filter((item) => String(item.occurredAt) <= occurredTo);
+    if (fromMs !== null) filtered = filtered.filter((item) => Date.parse(item.occurredAt) >= fromMs);
+    if (toMs !== null) filtered = filtered.filter((item) => Date.parse(item.occurredAt) <= toMs);
 
     const query = String(q ?? '').trim().toLocaleLowerCase('zh-CN');
     if (query) {

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import { Store } from '../scripts/lib/store.mjs';
 import { CommandService } from '../scripts/lib/commands.mjs';
 import { TaskService } from '../scripts/lib/task-service.mjs';
@@ -688,7 +689,7 @@ test('activity rejects invalid kind, time and limit with 422', async (t) => {
   assert.equal(valid.body.error, undefined);
 });
 
-test('SSE stream keeps the API alive instead of crashing the reply fail-safe', async (t) => {
+test('SSE stream stays open after hello and keeps the API alive', async (t) => {
   const { json, server } = await bootstrap(t);
   const controller = new AbortController();
   const stream = await fetch(`${server.baseUrl}/events/stream`, { signal: controller.signal });
@@ -698,10 +699,20 @@ test('SSE stream keeps the API alive instead of crashing the reply fail-safe', a
   const { value } = await reader.read();
   assert.match(new TextDecoder().decode(value), /event: hello/);
 
-  // Regression: the router's no-reply fail-safe used to sendJson over the
+  // Regression 1: the router's no-reply fail-safe used to sendJson over the
   // already-streaming response (ERR_HTTP_HEADERS_SENT) and kill the process.
   const healthWhileStreaming = await json('/health');
   assert.equal(healthWhileStreaming.status, 200);
+
+  // Regression 2: the JSON pipeline used to dereference the null reply
+  // after rawResponse handlers, throwing and res.end()-ing the stream right
+  // after hello. The connection must still be open here: the next read may
+  // hang until the next heartbeat, but EOF must not arrive.
+  const next = await Promise.race([
+    reader.read().then((result) => ({ kind: 'read', ...result })),
+    new Promise((resolve) => setTimeout(() => resolve({ kind: 'timeout' }), 1500))
+  ]);
+  assert.equal(next.kind, 'timeout', 'SSE connection must stay open after the hello event');
 
   controller.abort();
   await new Promise((resolve) => setTimeout(resolve, 150));
@@ -771,4 +782,73 @@ test('contacts commands validate employee numbers and required names', async (t)
 
   const tooShortNumber = await post('/contacts/commands', { type: 'remove', employeeNumber: '12' }, { ...headers, 'idempotency-key': 'idem-contact-shortnum' });
   assert.equal(tooShortNumber.status, 400);
+});
+
+test('contact upsert distinguishes clearing from omitting optional fields', async (t) => {
+  const { post, headers } = await bootstrap(t);
+  const created = await post('/contacts/commands', {
+    type: 'upsert', employeeNumber: '00500000', name: '陈墨', department: '客户成功部', address: '墨哥', autoContact: true
+  }, headers);
+  assert.equal(created.body.contact.department, '客户成功部');
+  assert.equal(created.body.contact.address, '墨哥');
+
+  const cleared = await post('/contacts/commands', {
+    type: 'upsert', employeeNumber: '00500000', name: '陈墨', department: null, address: null, autoContact: false
+  }, { ...headers, 'idempotency-key': 'idem-contact-clear' });
+  assert.equal(cleared.body.contact.department, null, 'explicit null clears the stored department');
+  assert.equal(cleared.body.contact.address, null, 'explicit null clears the stored address');
+
+  const reSet = await post('/contacts/commands', {
+    type: 'upsert', employeeNumber: '00500000', name: '陈墨', department: '客户成功部', autoContact: false
+  }, { ...headers, 'idempotency-key': 'idem-contact-reset' });
+  assert.equal(reSet.body.contact.department, '客户成功部');
+
+  const omitted = await post('/contacts/commands', {
+    type: 'upsert', employeeNumber: '00500000', name: '陈墨', autoContact: false
+  }, { ...headers, 'idempotency-key': 'idem-contact-omit' });
+  assert.equal(omitted.body.contact.department, '客户成功部', 'omitting the field keeps the stored value');
+});
+
+test('malformed contacts config aborts the write instead of being replaced', async (t) => {
+  const malformed = '{ "00123456": { "name": "张三",, }';
+  const { post, headers, root } = await bootstrap(t, async ({ root: fixtureRoot }) => {
+    await fs.writeFile(path.join(fixtureRoot, 'config', 'contacts.json'), malformed, 'utf8');
+  });
+
+  const attempted = await post('/contacts/commands', {
+    type: 'upsert', employeeNumber: '00200000', name: '王璐', autoContact: true
+  }, headers);
+  assert.equal(attempted.status, 500);
+  assert.equal(attempted.body.error.code, 'INTERNAL_ERROR');
+
+  const after = await fs.readFile(path.join(root, 'config', 'contacts.json'), 'utf8');
+  assert.equal(after, malformed, 'a malformed config must not be overwritten by console edits');
+});
+
+test('activity time windows compare instants across timezone representations', async (t) => {
+  const { json } = await bootstrap(t, async ({ store }) => {
+    await store.appendJsonl('messages.jsonl', {
+      log_id: 'MSG-TZ-BOUNDARY',
+      timestamp: '2026-09-01T00:30:00.000Z',
+      sequence: 9101,
+      direction: 'outbound',
+      participant_type: 'user',
+      participant_id: '00200000',
+      content: '时区边界记录',
+      status: 'succeeded',
+      task_id: null,
+      subtask_id: null,
+      conversation_id: null
+    });
+  });
+
+  // 2026-09-01T08:00:00+08:00 === 2026-09-01T00:00:00.000Z, so a record at
+  // 00:30Z is inside the window; lexicographic comparison used to drop it.
+  const feed = await json(`/activity?occurredFrom=${encodeURIComponent('2026-09-01T08:00:00+08:00')}&occurredTo=${encodeURIComponent('2026-09-01T23:59:59+08:00')}`);
+  assert.equal(feed.status, 200);
+  assert.equal(feed.body.total, 1);
+  assert.ok(feed.body.items.some((item) => item.id === 'MSG-TZ-BOUNDARY'), 'offset-form boundary must include the Z-form record');
+
+  const crossed = await json(`/activity?occurredFrom=${encodeURIComponent('2026-09-01T09:00:00+08:00')}&occurredTo=${encodeURIComponent('2026-09-01T08:00:00+08:00')}`);
+  assert.equal(crossed.status, 422, 'window ordering is compared as instants, not strings');
 });

@@ -210,20 +210,20 @@ export interface ArtifactListResponse {
 
 页面提供“刷新状态”按钮。该按钮只重新请求 `/health` 和 `/session`，不写入配置。
 
-### 7.2 后续可编辑设置
+### 7.2 可编辑设置的边界
 
-可编辑设置需要单独的后端契约和权限设计。未来若开放，所有 POST 都必须经过 CSRF、持久化幂等层、schema 校验和 mutation lock。需要 Agent 推理或外部发送的变更仍然写入命令队列。
+联系人白名单（2026-09-01 增量）是当前唯一开放编辑的本地配置，经由 `GET /api/v1/contacts` 与 `POST /api/v1/contacts/commands` 完成。浏览器不直接读写 `config/*.json`；Console API 仅允许在 mutation lock（`Store.mutateConfig`）、CSRF、schema 校验和持久化幂等层之下修改 contacts，且 DTO 不包含 `w3account`，未提交的文件字段在更新时保留。
 
-以下配置暂不在本设计中开放。
+其余可编辑设置仍需要单独的后端契约和权限设计。未来若开放，同样必须经过 CSRF、持久化幂等层、schema 校验和 mutation lock；需要 Agent 推理或外部发送的变更仍然写入命令队列。
+
+以下配置暂不开放。
 
 - owner 身份和 WeLink 凭据。
-- 联系人白名单和可信群。
+- 可信群。
 - 路由规则。
 - 自动回复策略。
 - `dry-run` 与 `live` 切换。
 - 消息发送风险策略。
-
-页面不能通过普通表单直接修改 `config/*.json`。
 
 ## 8. 共用视觉与交互
 
@@ -366,7 +366,7 @@ export interface ArtifactListResponse {
 - 产物下载只使用 artifact ID，不能接受客户端传入的文件路径。
 - 设置页不返回 `w3account`、CSRF token、配置路径和原始认证结果。
 - 员工号在设置页展示时脱敏，API 中现有逻辑主键不因此改变。
-- 第一阶段新增页面均为只读，不产生幂等写请求。
+- 三个页面中除联系人配置（7.2 节，走 Console API 的锁、CSRF、schema 与幂等层）外均为只读；浏览器任何情况下都不直接读写 `config/*.json`。
 
 ## 12. 文件改动建议
 

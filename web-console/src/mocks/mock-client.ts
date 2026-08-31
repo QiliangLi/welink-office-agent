@@ -358,18 +358,22 @@ export class MockConsoleClient implements ConsoleClient {
     if (!/^\d{4,16}$/.test(input.employeeNumber)) {
       throw Object.assign(new Error("员工号必须是 4 到 16 位数字。"), { code: "CONTACT_PAYLOAD_INVALID" });
     }
+    const index = this.contactsConfig.findIndex((entry) => entry.employeeNumber === input.employeeNumber);
+    // Same optional-field semantics as the server: omitted keeps the stored
+    // value, null clears it, a string replaces it.
+    const optional = (value: string | null | undefined, existing: string | null) =>
+      value === undefined ? existing ?? null : value;
     const next: ContactConfigDto = {
       employeeNumber: input.employeeNumber,
       name: input.name.trim(),
-      address: input.address ?? null,
-      department: input.department ?? null,
-      avatarInitials: input.name.trim().slice(0, 2).toUpperCase(),
-      expertise: [],
+      address: optional(input.address, this.contactsConfig[index]?.address ?? null),
+      department: optional(input.department, this.contactsConfig[index]?.department ?? null),
+      avatarInitials: this.contactsConfig[index]?.avatarInitials ?? input.name.trim().slice(0, 2).toUpperCase(),
+      expertise: this.contactsConfig[index]?.expertise ?? [],
       autoContact: input.autoContact,
-      autoReply: false,
+      autoReply: this.contactsConfig[index]?.autoReply ?? false,
     };
-    const index = this.contactsConfig.findIndex((entry) => entry.employeeNumber === input.employeeNumber);
-    if (index >= 0) this.contactsConfig[index] = { ...this.contactsConfig[index], ...next, expertise: this.contactsConfig[index].expertise };
+    if (index >= 0) this.contactsConfig[index] = next;
     else this.contactsConfig.push(next);
     return { contact: next };
   }

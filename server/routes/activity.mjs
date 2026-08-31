@@ -25,7 +25,9 @@ export function register(register, context) {
     if (occurredTo && Number.isNaN(Date.parse(occurredTo))) {
       throw invalidParam('occurredTo 不是有效的时间。', 'occurredTo');
     }
-    if (occurredFrom && occurredTo && occurredFrom > occurredTo) {
+    // Compare as instants: ISO strings with timezone offsets or different
+    // precision do not order lexicographically.
+    if (occurredFrom && occurredTo && Date.parse(occurredFrom) > Date.parse(occurredTo)) {
       throw invalidParam('occurredFrom 不能晚于 occurredTo。', 'occurredFrom');
     }
 

@@ -99,11 +99,16 @@ export function createRouter(context) {
             await context.idempotencyService.markRunning(idempotencyRecordKey, idempotencyAttemptId);
           }
           await matched.handler({ req, res, params, query, repeat, body, requestId, reply, context, idempotencyKey });
-          if (!captured && !matched.options.rawResponse) {
+          if (matched.options.rawResponse) {
+            // rawResponse routes (SSE) own the socket and keep streaming
+            // after the handler returns; the JSON pipeline must stop here —
+            // dereferencing a null `captured` would throw and the error
+            // path's res.end() would sever the open stream.
+            return;
+          }
+          if (!captured) {
             // Handler produced no reply — fail the idempotency attempt and
             // answer with a stable error instead of leaving the socket open.
-            // rawResponse routes (SSE) own the socket and stream past this
-            // point, so there is nothing to fail or send.
             if (idempotencyRecordKey) await context.idempotencyService.fail(idempotencyRecordKey, idempotencyAttemptId);
             const noReply = toApiError(Object.assign(new Error('处理器未返回响应。'), { status: 500, code: 'INTERNAL_ERROR' }));
             sendJson(res, noReply.status, { error: errorBody(noReply), requestId }, requestId);

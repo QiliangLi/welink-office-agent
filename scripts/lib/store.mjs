@@ -74,10 +74,21 @@ export class Store {
    * Locked read-modify-write of config/*.json for deterministic console
    * edits (e.g. the contacts whitelist). LockManager sanitizes the key to
    * NTFS-safe characters, so Windows lock files stay creatable.
+   *
+   * Only a missing file starts from an empty config; a malformed or
+   * unreadable file must abort the write — treating a parse error as an
+   * empty object would silently replace the owner's hand-maintained
+   * config (data loss).
    */
   async mutateConfig(name, mutator) {
     return this.locks.withLocks([`config-${name}`], async () => {
-      const config = await this.loadConfig(name).catch(() => ({}));
+      let config;
+      try {
+        config = await this.loadConfig(name);
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+        config = {};
+      }
       await mutator(config);
       await this.writeJson(path.join(this.configDir, `${name}.json`), config);
       return config;
